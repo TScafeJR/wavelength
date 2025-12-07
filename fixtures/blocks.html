@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Blocks</title>
+<style>
+  body { background: #f4f1ea; }
+  .card { padding: 16px; border: 4px solid #264653; background: #ffffff; }
+  .bar { height: 24px; background: #2a9d8f; }
+  .bar.short { width: 200px; }
+  .bar.centered { width: 320px; margin: 0 auto; background: #e9c46a; }
+  .bar.right { width: 120px; margin-left: auto; background: #e76f51; }
+  .gap { margin-bottom: 12px; }
+  .inset { margin: 0 40px; padding: 8px 24px; border: 2px solid #e76f51; background: rgb(38, 70, 83); }
+</style>
+</head>
+<body>
+<div class="card gap">
+  <div class="bar gap"></div>
+  <div class="bar short gap"></div>
+  <div class="bar centered gap"></div>
+  <div class="bar right"></div>
+</div>
+<div class="inset"><div class="bar" style="background: white; height: 40px"></div></div>
+</body>
+</html>

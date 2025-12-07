@@ -1,0 +1,26 @@
+<!doctype html>
+<html style="background: #222">
+<head>
+<meta charset="utf-8">
+<title>Cascade</title>
+<style>
+  body { background: #fafafa; margin: 20px; padding: 10px; border: 5px solid teal; color: purple; }
+  div { height: 30px; background: silver; margin-bottom: 10px; }
+  .a { background: orange; }
+  section .a { background: navy; }
+  #id.a { background: #c00; }
+  div.hidden { display: none; }
+  .frame { height: auto; background: transparent; border-style: solid; padding: 6px; }
+  .frame div { margin-bottom: 0; }
+  .wide { width: 1000px; margin-left: -30px; background: olive; }
+</style>
+</head>
+<body>
+<div></div>
+<div class="a"></div>
+<section><div class="a"></div><div class="a" id="id"></div></section>
+<div class="hidden a"></div>
+<div class="frame"><div style="background: #369; height: 12px"></div></div>
+<div class="wide"></div>
+</body>
+</html>
