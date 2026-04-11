@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs when the app is opened from Finder: starts the browser window.
+contents=$(cd "$(dirname "$0")/.." && pwd)
+exec "$contents/MacOS/wavelength" browse
