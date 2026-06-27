@@ -1,20 +1,21 @@
 //! The command line: render a page to a PNG, or compare pages against Chrome.
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use wavelength::{Error, Page, Result, Viewport, report};
+use wavelength::{Error, Page, Result, Viewport, report, url};
 
 const USAGE: &str = "\
 A from-scratch browser engine, measured against Chrome.
 
 Usage:
-  wavelength render <page.html> [--out FILE] [--width N] [--height N]
+  wavelength render <page.html or URL> [--out FILE] [--width N] [--height N]
+  wavelength browse [URL]...
   wavelength compare <page.html>... [--out DIR] [--width N] [--height N] [--max-diff PERCENT]
 
 Commands:
-  render   Paint one page with the engine and write a PNG (default: render.png)
+  browse   Open the browser window, with one tab per URL given
+  render   Paint one page, local or on the web, and write a PNG (default: render.png)
   compare  Render each page with the engine and with Chrome, then write the
            images, diff overlays and an index.html report (default: report/)
 
@@ -55,6 +56,7 @@ fn run(arguments: Vec<String>) -> Result<()> {
     match command.as_str() {
         "render" => render(parse_options(arguments)?),
         "compare" => compare(parse_options(arguments)?),
+        "browse" => browse(arguments.collect()),
         "" | "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(())
@@ -65,6 +67,19 @@ fn run(arguments: Vec<String>) -> Result<()> {
         }
         other => Err(Error::Usage(format!("unknown command: {other}"))),
     }
+}
+
+#[cfg(feature = "window")]
+fn browse(addresses: Vec<String>) -> Result<()> {
+    wavelength::browse::run(&addresses)
+}
+
+#[cfg(not(feature = "window"))]
+fn browse(_addresses: Vec<String>) -> Result<()> {
+    Err(Error::Usage(
+        "this build has no window; rebuild with `cargo build --release --features window`"
+            .to_owned(),
+    ))
 }
 
 fn parse_options(mut arguments: impl Iterator<Item = String>) -> Result<Options> {
@@ -115,8 +130,10 @@ fn render(options: Options) -> Result<()> {
         return Err(Error::Usage("render takes exactly one page".to_owned()));
     };
     let out = options.out.unwrap_or_else(|| PathBuf::from("render.png"));
-    let html = fs::read_to_string(page)?;
-    Page::load(&html, options.viewport).render().save(&out)?;
+    let target = url::from_input(&page.to_string_lossy());
+    Page::fetch(&target, options.viewport)?
+        .render()
+        .save(&out)?;
     println!("wrote {}", out.display());
     Ok(())
 }

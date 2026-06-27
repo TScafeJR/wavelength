@@ -1,90 +1,239 @@
 //! Painting: turns a layout tree into pixels.
 
-use crate::dom::Document;
+use std::collections::HashMap;
+
+use crate::dom::{Document, NodeId};
+use crate::font::Fonts;
 use crate::image::Image;
-use crate::layout::{LayoutBox, Rect};
+use crate::layout::{Fragment, LayoutBox, Rect};
 use crate::style::Color;
 
-/// Paints the layout tree onto a canvas of the given size.
+/// Everything the painter needs to draw a page.
+#[derive(Debug, Clone, Copy)]
+pub struct Scene<'a> {
+    /// The document the layout tree was built from.
+    pub doc: &'a Document,
+    /// The root of the layout tree, if the page generates any boxes.
+    pub root: Option<&'a LayoutBox>,
+    /// The fonts used to draw text.
+    pub fonts: &'a Fonts,
+    /// Decoded pictures, by `img` element.
+    pub images: &'a HashMap<NodeId, Image>,
+}
+
+/// Paints the part of the page that starts `scroll_y` pixels down, onto a canvas of the given size.
 ///
 /// The canvas takes the root element's background, or the body's when the
 /// root has none, or white. The element that lends its background to the
 /// canvas does not paint it a second time on its own box.
-pub fn paint(doc: &Document, root: Option<&LayoutBox>, width: u32, height: u32) -> Image {
-    let Some(root) = root else {
+pub fn paint(scene: Scene<'_>, width: u32, height: u32, scroll_y: f32) -> Image {
+    let Some(root) = scene.root else {
         return Image::new(width, height, rgba(Color::WHITE));
     };
-    let body = root
-        .children
-        .iter()
-        .find(|child| doc.element(child.node).is_some_and(|e| e.name == "body"));
+    let body = root.children.iter().find(|child| {
+        scene
+            .doc
+            .element(child.node)
+            .is_some_and(|e| e.name == "body")
+    });
     let canvas_source = [Some(root), body]
         .into_iter()
         .flatten()
         .find(|candidate| !candidate.style.background.is_transparent());
 
     let canvas_color = canvas_source.map_or(Color::WHITE, |source| source.style.background);
-    let mut image = Image::new(width, height, rgba(canvas_color));
-    paint_box(&mut image, root, canvas_source.map(|source| source.node));
-    image
-}
-
-fn paint_box(
-    image: &mut Image,
-    layout_box: &LayoutBox,
-    skip_background: Option<crate::dom::NodeId>,
-) {
-    let (rect, style) = (layout_box.rect, &layout_box.style);
-    if skip_background != Some(layout_box.node) {
-        fill(image, rect, style.background);
-    }
-
-    let (border, color) = (style.border(), style.used_border_color());
-    let inner_height = rect.height - border.top - border.bottom;
-    let edge = |x, y, width, height| Rect {
-        x,
-        y,
-        width,
-        height,
+    let mut painter = Painter {
+        image: Image::new(width, height, [255, 255, 255, 255]),
+        scene,
+        offset_y: -scroll_y,
+        skip_background: canvas_source.map(|source| source.node),
     };
-    for side in [
-        edge(rect.x, rect.y, rect.width, border.top),
-        edge(
-            rect.x,
-            rect.y + rect.height - border.bottom,
-            rect.width,
-            border.bottom,
-        ),
-        edge(rect.x, rect.y + border.top, border.left, inner_height),
-        edge(
-            rect.x + rect.width - border.right,
-            rect.y + border.top,
-            border.right,
-            inner_height,
-        ),
-    ] {
-        fill(image, side, color);
-    }
-
-    for child in &layout_box.children {
-        paint_box(image, child, skip_background);
-    }
+    let everything = Rect {
+        x: 0.0,
+        y: scroll_y,
+        width: width as f32,
+        height: height as f32,
+    };
+    painter.fill(everything, canvas_color);
+    painter.paint_box(root);
+    painter.image
 }
 
-/// Fills a rectangle after snapping each edge to the nearest pixel boundary.
-fn fill(image: &mut Image, rect: Rect, color: Color) {
-    if color.is_transparent() || rect.width <= 0.0 || rect.height <= 0.0 {
-        return;
+/// How a run of text is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextStyle {
+    /// The font size in pixels.
+    pub size: f32,
+    /// Whether the bold face is used.
+    pub bold: bool,
+    /// The text colour.
+    pub color: Color,
+}
+
+/// Draws a run of text with its baseline at `baseline`, starting at `x`.
+pub fn draw_text(
+    image: &mut Image,
+    fonts: &Fonts,
+    x: f32,
+    baseline: f32,
+    text: &str,
+    style: TextStyle,
+) {
+    let (color, baseline) = (rgba(style.color), baseline.round() as i64);
+    fonts.glyphs(text, style.size, style.bold, |pen, glyph| {
+        let left = (x + pen).round() as i64 + i64::from(glyph.left);
+        let top = baseline + i64::from(glyph.top);
+        for (index, &coverage) in glyph.coverage.iter().enumerate() {
+            if coverage > 0 {
+                let (column, row) = (index % glyph.width, index / glyph.width);
+                image.blend(left + column as i64, top + row as i64, color, coverage);
+            }
+        }
+    });
+}
+
+struct Painter<'a> {
+    image: Image,
+    scene: Scene<'a>,
+    /// Added to every y coordinate, which is how scrolling is applied.
+    offset_y: f32,
+    skip_background: Option<NodeId>,
+}
+
+impl Painter<'_> {
+    fn paint_box(&mut self, layout_box: &LayoutBox) {
+        let (rect, style) = (layout_box.rect, &layout_box.style);
+        if self.skip_background != Some(layout_box.node) {
+            self.fill(rect, style.background);
+        }
+
+        let (border, colors) = (style.border(), style.used_border_color());
+        let inner_height = rect.height - border.top - border.bottom;
+        let edge = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let right_x = rect.x + rect.width - border.right;
+        let bottom_y = rect.y + rect.height - border.bottom;
+        self.fill(edge(rect.x, rect.y, rect.width, border.top), colors.top);
+        self.fill(
+            edge(rect.x, bottom_y, rect.width, border.bottom),
+            colors.bottom,
+        );
+        self.fill(
+            edge(rect.x, rect.y + border.top, border.left, inner_height),
+            colors.left,
+        );
+        self.fill(
+            edge(right_x, rect.y + border.top, border.right, inner_height),
+            colors.right,
+        );
+
+        if let Some(picture) = self.scene.images.get(&layout_box.node) {
+            let padding = style.padding;
+            let content = Rect {
+                x: rect.x + border.left + padding.left,
+                y: rect.y + border.top + padding.top,
+                width: rect.width - border.left - border.right - padding.left - padding.right,
+                height: inner_height - padding.top - padding.bottom,
+            };
+            self.draw_image(picture, content);
+        }
+
+        for child in &layout_box.children {
+            self.paint_box(child);
+        }
+        for fragment in &layout_box.fragments {
+            self.paint_text(fragment);
+        }
     }
-    // Float to integer casts saturate, so negative edges clamp to zero.
-    let snap = |edge: f32| edge.round() as u32;
-    image.fill(
-        snap(rect.x),
-        snap(rect.y),
-        snap(rect.x + rect.width),
-        snap(rect.y + rect.height),
-        rgba(color),
-    );
+
+    fn paint_text(&mut self, fragment: &Fragment) {
+        let baseline = fragment.baseline + self.offset_y;
+        let visible = -fragment.size * 2.0..self.image.height() as f32 + fragment.size * 2.0;
+        if !visible.contains(&baseline) {
+            return;
+        }
+        let style = TextStyle {
+            size: fragment.size,
+            bold: fragment.bold,
+            color: fragment.color,
+        };
+        draw_text(
+            &mut self.image,
+            self.scene.fonts,
+            fragment.rect.x,
+            baseline,
+            &fragment.text,
+            style,
+        );
+        if fragment.underline {
+            let thickness = (fragment.size / 16.0).round().max(1.0);
+            let line = Rect {
+                x: fragment.rect.x,
+                y: fragment.baseline.round() + 1.0,
+                width: fragment.rect.width,
+                height: thickness,
+            };
+            self.fill(line, fragment.color);
+        }
+    }
+
+    /// The pixel bounds of a rectangle after scrolling, with each edge snapped
+    /// to the nearest pixel boundary and clipped to the canvas.
+    fn pixel_bounds(&self, rect: Rect) -> Option<(u32, u32, u32, u32)> {
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return None;
+        }
+        // Float to integer casts saturate, so edges left of or above the canvas clamp to zero.
+        let snap = |edge: f32, limit: u32| (edge.round() as u32).min(limit);
+        let (width, height) = (self.image.width(), self.image.height());
+        let (x0, x1) = (snap(rect.x, width), snap(rect.x + rect.width, width));
+        let top = rect.y + self.offset_y;
+        let (y0, y1) = (snap(top, height), snap(top + rect.height, height));
+        (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+    }
+
+    fn fill(&mut self, rect: Rect, color: Color) {
+        if color.is_transparent() {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.pixel_bounds(rect) else {
+            return;
+        };
+        if color.a == 255 {
+            self.image.fill(x0, y0, x1, y1, rgba(color));
+            return;
+        }
+        for y in y0..y1 {
+            for x in x0..x1 {
+                self.image
+                    .blend(i64::from(x), i64::from(y), rgba(color), 255);
+            }
+        }
+    }
+
+    /// Draws a picture scaled to fill `target`, sampling the nearest source pixel.
+    fn draw_image(&mut self, picture: &Image, target: Rect) {
+        let Some((x0, y0, x1, y1)) = self.pixel_bounds(target) else {
+            return;
+        };
+        let left = target.x.round();
+        let top = (target.y + self.offset_y).round();
+        let scale_x = picture.width() as f32 / target.width;
+        let scale_y = picture.height() as f32 / target.height;
+        for y in y0..y1 {
+            let source_y = ((y as f32 - top + 0.5) * scale_y) as u32;
+            for x in x0..x1 {
+                let source_x = ((x as f32 - left + 0.5) * scale_x) as u32;
+                if let Some(pixel) = picture.pixel(source_x, source_y) {
+                    self.image.blend(i64::from(x), i64::from(y), pixel, 255);
+                }
+            }
+        }
+    }
 }
 
 fn rgba(color: Color) -> [u8; 4] {
@@ -93,19 +242,25 @@ fn rgba(color: Color) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{html, layout, style};
+    use crate::font::Fonts;
+    use crate::image::Image;
+    use crate::page::{Page, Viewport};
 
     const WHITE: [u8; 4] = [255, 255, 255, 255];
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLUE: [u8; 4] = [0, 0, 255, 255];
     const GREEN: [u8; 4] = [0, 128, 0, 255];
 
+    fn page(html: &str) -> Page {
+        let viewport = Viewport {
+            width: 100,
+            height: 60,
+        };
+        Page::load(html, viewport)
+    }
+
     fn render(html: &str) -> Image {
-        let doc = html::parse(html);
-        let styles = style::compute(&doc);
-        let root = layout::layout(&doc, &styles, 100.0);
-        paint(&doc, root.as_ref(), 100, 60)
+        page(html).render()
     }
 
     #[test]
@@ -121,6 +276,17 @@ mod tests {
         assert_eq!(image.pixel(30, 19), Some(BLUE));
         assert_eq!(image.pixel(31, 21), Some(BLUE));
         assert_eq!(image.pixel(32, 22), Some(WHITE));
+    }
+
+    #[test]
+    fn each_border_side_has_its_own_color() {
+        let image = render(
+            "<div style='width: 20px; height: 10px; border: 2px solid; border-color: red blue green white'></div>",
+        );
+        assert_eq!(image.pixel(15, 8), Some(RED));
+        assert_eq!(image.pixel(31, 15), Some(BLUE));
+        assert_eq!(image.pixel(15, 21), Some(GREEN));
+        assert_eq!(image.pixel(8, 15), Some(WHITE));
     }
 
     #[test]
@@ -147,5 +313,40 @@ mod tests {
         );
         assert_eq!(image.pixel(0, 8), Some(BLUE));
         assert_eq!(image.pixel(99, 59), Some(BLUE));
+    }
+
+    #[test]
+    fn translucent_colors_blend_with_what_is_underneath() {
+        let image = render("<div style='height: 10px; background: rgba(255, 0, 0, 0.5)'></div>");
+        assert_eq!(image.pixel(10, 10), Some([255, 127, 127, 255]));
+    }
+
+    #[test]
+    fn scrolling_moves_the_page_up() {
+        let page = page(
+            "<div style='height: 100px'></div><div style='height: 20px; background: red'></div>",
+        );
+        assert_eq!(page.render().pixel(10, 50), Some(WHITE));
+        assert_eq!(page.render_at(70.0).pixel(10, 40), Some(RED));
+        assert_eq!(page.render_at(70.0).pixel(10, 37), Some(WHITE));
+    }
+
+    #[test]
+    fn text_leaves_ink_in_its_own_color() {
+        if !Fonts::system().available() {
+            return;
+        }
+        let image = render("<div style='color: red; font-size: 30px'>MMM</div>");
+        let mut inked = 0;
+        for y in 0..60 {
+            for x in 0..100 {
+                match image.pixel(x, y) {
+                    Some(RED) => inked += 1,
+                    Some([_, g, b, _]) => assert_eq!(g, b, "only red ink is expected"),
+                    None => {}
+                }
+            }
+        }
+        assert!(inked > 100, "{inked}");
     }
 }

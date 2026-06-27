@@ -12,6 +12,10 @@ pub enum Error {
     Io(std::io::Error),
     /// A PNG file could not be encoded or decoded.
     Image(String),
+    /// A page or resource could not be fetched.
+    Network(String),
+    /// The browser window could not be opened or updated.
+    Window(String),
     /// A selector passed to the page API is not supported.
     Selector(String),
     /// Chrome could not produce a reference screenshot.
@@ -29,6 +33,8 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Image(message) => write!(f, "image error: {message}"),
+            Self::Network(message) => write!(f, "could not load {message}"),
+            Self::Window(message) => write!(f, "window error: {message}"),
             Self::Selector(selector) => write!(f, "unsupported selector: {selector}"),
             Self::Chrome(message) => write!(f, "Chrome reference failed: {message}"),
             Self::BrowserNotFound => write!(

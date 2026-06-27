@@ -25,18 +25,24 @@
 //! assert_eq!(page.render().pixel(8, 8), Some([0, 128, 128, 255]));
 //! ```
 
+#[cfg(feature = "window")]
+pub mod browse;
 pub mod chrome;
 pub mod css;
 pub mod diff;
 pub mod dom;
 pub mod error;
+pub mod font;
 pub mod html;
 pub mod image;
 pub mod layout;
+pub mod net;
 pub mod page;
 pub mod paint;
 pub mod report;
+pub mod session;
 pub mod style;
+pub mod url;
 
 pub use error::{Error, Result};
 pub use page::{Page, Viewport};

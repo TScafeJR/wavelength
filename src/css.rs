@@ -31,8 +31,10 @@ pub struct Rule {
 pub struct Declaration {
     /// The property name, lowercased.
     pub name: String,
-    /// The value, trimmed and lowercased.
+    /// The value, trimmed and lowercased, without any `!important` marker.
     pub value: String,
+    /// Whether the declaration was marked `!important`.
+    pub important: bool,
 }
 
 /// A complex selector: compounds joined by descendant combinators.
@@ -88,10 +90,17 @@ pub fn parse_declarations(block: &str) -> Vec<Declaration> {
         .split(';')
         .filter_map(|declaration| {
             let (name, value) = declaration.split_once(':')?;
-            let (name, value) = (name.trim(), value.trim());
+            let (name, value) = (name.trim(), value.trim().to_ascii_lowercase());
+            let (value, important) = match value.rsplit_once('!') {
+                Some((rest, flag)) if flag.trim() == "important" => {
+                    (rest.trim_end().to_owned(), true)
+                }
+                _ => (value, false),
+            };
             (!name.is_empty() && !value.is_empty()).then(|| Declaration {
                 name: name.to_ascii_lowercase(),
-                value: value.to_ascii_lowercase(),
+                value,
+                important,
             })
         })
         .collect()
@@ -236,7 +245,8 @@ mod tests {
 
     #[test]
     fn rules_and_declarations_are_parsed() {
-        let sheet = parse("/* note */ div, .a { Color: RED; margin : 0 auto ;; } p{width:1px}");
+        let sheet =
+            parse("/* note */ div, .a { Color: RED; margin : 0 auto ;; } p{width:1px ! important}");
         assert_eq!(sheet.rules.len(), 2);
         assert_eq!(sheet.rules[0].selectors.len(), 2);
         assert_eq!(
@@ -244,11 +254,13 @@ mod tests {
             [
                 Declaration {
                     name: "color".into(),
-                    value: "red".into()
+                    value: "red".into(),
+                    important: false,
                 },
                 Declaration {
                     name: "margin".into(),
-                    value: "0 auto".into()
+                    value: "0 auto".into(),
+                    important: false,
                 },
             ]
         );

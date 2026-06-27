@@ -1,12 +1,25 @@
-//! Block layout.
+//! Layout: block flow, inline content in line boxes, inline-blocks, form
+//! controls, images and a simplified table algorithm.
 //!
-//! Every block box is placed below the previous one inside its parent's
-//! content box, with widths resolved by the rules of CSS 2.1 section 10.3.3.
-//! Margin collapsing, inline content, floats and positioning are not
-//! implemented yet; see the roadmap.
+//! Block boxes stack vertically and adjacent sibling margins collapse. Inline
+//! content is broken into lines at spaces. Tables size their columns from
+//! their content and any widths given. Floats, positioning, flexbox, grid and
+//! margin collapsing between parents and children are not implemented yet;
+//! see the roadmap.
 
-use crate::dom::{Document, NodeId};
-use crate::style::{Display, Style};
+use std::collections::HashMap;
+
+use crate::dom::{Document, NodeData, NodeId};
+use crate::font::Fonts;
+use crate::style::{Color, Display, Edges, Length, Style, TextAlign, VerticalAlign};
+
+/// A width no real container has, used to measure content without wrapping it.
+const UNBOUNDED: f32 = 1.0e6;
+/// Slack when deciding whether a word still fits, to absorb rounding in summed widths.
+const FIT_TOLERANCE: f32 = 0.01;
+/// The gap browsers leave between table cells unless told otherwise.
+const DEFAULT_CELL_SPACING: f32 = 2.0;
+const PLACEHOLDER_COLOR: Color = Color::rgb(117, 117, 117);
 
 /// A rectangle in CSS pixels, relative to the top left of the page.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,7 +34,35 @@ pub struct Rect {
     pub height: f32,
 }
 
-/// A laid-out box and the boxes inside it.
+impl Rect {
+    /// Whether the point lies inside the rectangle.
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
+
+/// A run of text placed on one line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fragment {
+    /// The text node the run comes from, or the form control that displays it.
+    pub node: NodeId,
+    /// The area the run occupies, from the font's ascent to its descent.
+    pub rect: Rect,
+    /// The y coordinate of the baseline.
+    pub baseline: f32,
+    /// The characters to draw.
+    pub text: String,
+    /// The font size in pixels.
+    pub size: f32,
+    /// Whether the bold face is used.
+    pub bold: bool,
+    /// The text colour.
+    pub color: Color,
+    /// Whether the run is underlined.
+    pub underline: bool,
+}
+
+/// A laid-out box, the boxes inside it and the text it places directly.
 #[derive(Debug, Clone)]
 pub struct LayoutBox {
     /// The element that generated this box.
@@ -32,6 +73,10 @@ pub struct LayoutBox {
     pub style: Style,
     /// Child boxes in document order.
     pub children: Vec<LayoutBox>,
+    /// Text placed in this box's own lines.
+    pub fragments: Vec<Fragment>,
+    /// The width this box would like including margins, used to size shrink-to-fit parents.
+    preferred_width: f32,
 }
 
 impl LayoutBox {
@@ -42,82 +87,882 @@ impl LayoutBox {
         }
         self.children.iter().find_map(|child| child.find(node))
     }
+
+    /// The node drawn at a point: the topmost box or text run that contains it.
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
+        // Children may overflow their parent, so they are searched regardless of this box's bounds.
+        if let Some(node) = self.children.iter().rev().find_map(|c| c.hit_test(x, y)) {
+            return Some(node);
+        }
+        if let Some(fragment) = self.fragments.iter().find(|f| f.rect.contains(x, y)) {
+            return Some(fragment.node);
+        }
+        self.rect.contains(x, y).then_some(self.node)
+    }
+
+    fn translate(&mut self, dx: f32, dy: f32) {
+        self.rect.x += dx;
+        self.rect.y += dy;
+        self.translate_contents(dx, dy);
+    }
+
+    fn translate_contents(&mut self, dx: f32, dy: f32) {
+        for fragment in &mut self.fragments {
+            fragment.rect.x += dx;
+            fragment.rect.y += dy;
+            fragment.baseline += dy;
+        }
+        for child in &mut self.children {
+            child.translate(dx, dy);
+        }
+    }
+}
+
+/// Everything layout needs to know about a document.
+#[derive(Debug, Clone, Copy)]
+pub struct Context<'a> {
+    /// The document tree.
+    pub doc: &'a Document,
+    /// One computed style per node, indexed by node id.
+    pub styles: &'a [Style],
+    /// The fonts used to measure text.
+    pub fonts: &'a Fonts,
+    /// The pixel size of each image that was loaded, by `img` element.
+    pub image_sizes: &'a HashMap<NodeId, (u32, u32)>,
+    /// Text typed into form fields, which overrides their `value` attribute.
+    pub values: &'a HashMap<NodeId, String>,
+    /// The form field that has keyboard focus, which is drawn with a caret.
+    pub focused: Option<NodeId>,
 }
 
 /// Lays out the document for a viewport of the given width.
 ///
 /// Returns `None` when the root element generates no box.
-pub fn layout(doc: &Document, styles: &[Style], viewport_width: f32) -> Option<LayoutBox> {
-    let root = doc.find_element("html")?;
-    (styles[root.0].display == Display::Block)
-        .then(|| block(doc, styles, root, viewport_width, 0.0, 0.0))
+pub fn layout(context: Context<'_>, viewport_width: f32) -> Option<LayoutBox> {
+    let root = context.doc.find_element("html")?;
+    let style = &context.styles[root.0];
+    (style.display != Display::None).then(|| {
+        let top = style.margin.top.unwrap_or(0.0);
+        context.flow_box(root, viewport_width, 0.0, top, false)
+    })
 }
 
-/// Lays out one block box whose margin box starts at (`x`, `y`) inside a
-/// containing block that is `containing_width` wide.
-fn block(
-    doc: &Document,
-    styles: &[Style],
-    node: NodeId,
-    containing_width: f32,
+fn margins(style: &Style) -> Edges<f32> {
+    Edges {
+        top: style.margin.top.unwrap_or(0.0),
+        right: style.margin.right.unwrap_or(0.0),
+        bottom: style.margin.bottom.unwrap_or(0.0),
+        left: style.margin.left.unwrap_or(0.0),
+    }
+}
+
+/// The horizontal space a box's border and padding take up.
+fn frame_width(style: &Style) -> f32 {
+    let border = style.border();
+    border.left + style.padding.left + style.padding.right + border.right
+}
+
+fn frame_height(style: &Style) -> f32 {
+    let border = style.border();
+    border.top + style.padding.top + style.padding.bottom + border.bottom
+}
+
+/// The margin between two boxes whose margins touch.
+fn collapse(first: f32, second: f32) -> f32 {
+    if first >= 0.0 && second >= 0.0 {
+        first.max(second)
+    } else if first < 0.0 && second < 0.0 {
+        first.min(second)
+    } else {
+        first + second
+    }
+}
+
+impl<'a> Context<'a> {
+    fn style(&self, node: NodeId) -> &'a Style {
+        &self.styles[node.0]
+    }
+
+    /// Lays out a block-level box whose border box starts at `y`, inside a
+    /// containing block that starts at `x` and is `containing_width` wide.
+    fn flow_box(
+        &self,
+        node: NodeId,
+        containing_width: f32,
+        x: f32,
+        y: f32,
+        measuring: bool,
+    ) -> LayoutBox {
+        if self.style(node).display == Display::Table {
+            self.table(node, containing_width, x, y, measuring)
+        } else if self.is_replaced(node) {
+            // An image or form control displayed as a block keeps its own size.
+            let mut replaced = self.atomic(node, containing_width, measuring);
+            let left = self.margin_left(node, containing_width, replaced.rect.width);
+            replaced.translate(x + left, y);
+            replaced
+        } else {
+            self.block(node, containing_width, x, y, None, measuring)
+        }
+    }
+
+    /// Whether the element's content comes from outside the document tree, so it is sized as a unit.
+    fn is_replaced(&self, node: NodeId) -> bool {
+        let name = self
+            .doc
+            .element(node)
+            .map_or("", |element| element.name.as_str());
+        matches!(name, "img" | "input" | "textarea" | "select")
+    }
+
+    /// Where a box of the given border-box width sits horizontally in its containing block.
+    fn margin_left(&self, node: NodeId, containing_width: f32, border_box_width: f32) -> f32 {
+        let style = self.style(node);
+        let free =
+            |fixed_margins: f32| (containing_width - border_box_width - fixed_margins).max(0.0);
+        let parent_centers = self
+            .doc
+            .node(node)
+            .parent
+            .is_some_and(|parent| self.style(parent).center_blocks);
+        match (style.margin.left, style.margin.right) {
+            (Some(left), Some(right)) if parent_centers => left + free(left + right) / 2.0,
+            (Some(left), _) => left,
+            // Auto margins absorb the free space, and count as zero when there is none.
+            (None, Some(right)) => free(right),
+            (None, None) => free(0.0) / 2.0,
+        }
+    }
+
+    /// Lays out a block container. `forced_width` fixes the content width, for
+    /// boxes whose width was decided by their parent.
+    fn block(
+        &self,
+        node: NodeId,
+        containing_width: f32,
+        x: f32,
+        y: f32,
+        forced_width: Option<f32>,
+        measuring: bool,
+    ) -> LayoutBox {
+        let style = *self.style(node);
+        let (border, padding, margin) = (style.border(), style.padding, margins(&style));
+        let frame = frame_width(&style);
+
+        let specified = forced_width.or(match style.width {
+            Some(Length::Px(width)) => Some(width),
+            // A percentage of an unknown width cannot be resolved while measuring.
+            Some(Length::Percent(percent)) if !measuring => {
+                Some(containing_width * percent / 100.0)
+            }
+            _ => None,
+        });
+        let fill = (containing_width - margin.left - margin.right - frame).max(0.0);
+        let mut width = specified.unwrap_or(fill);
+        if let Some(max_width) = style.max_width {
+            width = width.min(max_width);
+        }
+
+        let rect_x = x + self.margin_left(node, containing_width, width + frame);
+        let content_x = rect_x + border.left + padding.left;
+        let content_y = y + border.top + padding.top;
+
+        let mut flow = Flow::new(self, node, content_x, width, content_y, measuring);
+        self.walk(&mut flow, node);
+        let (children, fragments, content_bottom, extent) = flow.finish();
+
+        let content_height = match style.height {
+            Some(Length::Px(height)) => height,
+            _ => content_bottom - content_y,
+        };
+        let has_fixed_width = specified.is_some() || style.max_width.is_some_and(|max| max < fill);
+        let preferred_content = if has_fixed_width { width } else { extent };
+        LayoutBox {
+            node,
+            rect: Rect {
+                x: rect_x,
+                y,
+                width: width + frame,
+                height: content_height + frame_height(&style),
+            },
+            style,
+            children,
+            fragments,
+            preferred_width: preferred_content + frame + margin.left + margin.right,
+        }
+    }
+
+    /// Feeds the children of `parent` into a flow, descending through inline elements.
+    fn walk(&self, flow: &mut Flow<'_, 'a>, parent: NodeId) {
+        for &child in &self.doc.node(parent).children {
+            let style = self.style(child);
+            match &self.doc.node(child).data {
+                NodeData::Document => {}
+                NodeData::Text(text) => flow.text(child, text, style),
+                NodeData::Element(_) if style.display == Display::None => {}
+                NodeData::Element(element) if element.name == "br" => flow.line_break(style),
+                NodeData::Element(_) => match style.display {
+                    Display::None => {}
+                    Display::Inline if !self.is_replaced(child) => self.walk(flow, child),
+                    Display::Inline | Display::InlineBlock => {
+                        let inline_box = self.atomic(child, flow.width, flow.measuring);
+                        flow.atomic(inline_box, margins(style), self.style(parent).nowrap);
+                    }
+                    Display::Block | Display::Table | Display::TableRow | Display::TableCell => {
+                        flow.block_child(child);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Lays out a box that sits on a line as one unit, with its border box at the origin.
+    fn atomic(&self, node: NodeId, available: f32, measuring: bool) -> LayoutBox {
+        let style = *self.style(node);
+        let name = self
+            .doc
+            .element(node)
+            .map_or("", |element| element.name.as_str());
+        let mut laid_out = match name {
+            "img" => {
+                let (width, height) = self.image_size(node, &style);
+                self.leaf(node, style, width, height, Vec::new())
+            }
+            "input" => self.input(node, style),
+            "textarea" | "select" => {
+                let columns = if name == "textarea" { 20.0 } else { 8.0 };
+                let rows = if name == "textarea" { 2.0 } else { 1.0 };
+                let metrics = self.fonts.metrics(style.font_size, style.bold);
+                let line =
+                    style.used_line_height(metrics.ascent + metrics.descent + metrics.line_gap);
+                let width = self.fonts.measure("0", style.font_size, style.bold) * columns;
+                self.leaf(
+                    node,
+                    style,
+                    self.fixed_width(&style).unwrap_or(width),
+                    line * rows,
+                    Vec::new(),
+                )
+            }
+            _ => {
+                let margin = margins(&style);
+                let outside = frame_width(&style) + margin.left + margin.right;
+                let width = match style.width {
+                    Some(Length::Px(width)) => width,
+                    Some(Length::Percent(percent)) if !measuring => available * percent / 100.0,
+                    _ => {
+                        // Shrink to fit: as wide as the content wants, up to the space available.
+                        let probe = self.block(node, UNBOUNDED, 0.0, 0.0, None, true);
+                        let preferred = (probe.preferred_width - outside).max(0.0);
+                        preferred.min((available - outside).max(0.0))
+                    }
+                };
+                self.block(node, available, 0.0, 0.0, Some(width), measuring)
+            }
+        };
+        let (dx, dy) = (-laid_out.rect.x, -laid_out.rect.y);
+        laid_out.translate(dx, dy);
+        laid_out
+    }
+
+    fn fixed_width(&self, style: &Style) -> Option<f32> {
+        match style.width {
+            Some(Length::Px(width)) => Some(width),
+            _ => None,
+        }
+    }
+
+    /// A box with a known content size and no flowed children.
+    fn leaf(
+        &self,
+        node: NodeId,
+        style: Style,
+        width: f32,
+        height: f32,
+        fragments: Vec<Fragment>,
+    ) -> LayoutBox {
+        let margin = margins(&style);
+        let rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: width + frame_width(&style),
+            height: height + frame_height(&style),
+        };
+        LayoutBox {
+            node,
+            rect,
+            style,
+            children: Vec::new(),
+            fragments,
+            preferred_width: rect.width + margin.left + margin.right,
+        }
+    }
+
+    /// The content size of an image: what CSS or the markup asks for, else the picture's own size.
+    fn image_size(&self, node: NodeId, style: &Style) -> (f32, f32) {
+        let pixels = |length: Option<Length>| match length {
+            Some(Length::Px(value)) => Some(value),
+            _ => None,
+        };
+        let intrinsic = self
+            .image_sizes
+            .get(&node)
+            .map(|&(w, h)| (w as f32, h as f32));
+        match (pixels(style.width), pixels(style.height), intrinsic) {
+            (Some(width), Some(height), _) => (width, height),
+            (Some(width), None, Some((iw, ih))) if iw > 0.0 => (width, width * ih / iw),
+            (None, Some(height), Some((iw, ih))) if ih > 0.0 => (height * iw / ih, height),
+            (None, None, Some(size)) => size,
+            (width, height, _) => (width.unwrap_or(0.0), height.unwrap_or(0.0)),
+        }
+    }
+
+    /// A form field or button, with its value or label as text inside.
+    fn input(&self, node: NodeId, style: Style) -> LayoutBox {
+        let Some(element) = self.doc.element(node) else {
+            return self.leaf(node, style, 0.0, 0.0, Vec::new());
+        };
+        let kind = element
+            .attribute("type")
+            .unwrap_or("text")
+            .to_ascii_lowercase();
+        if matches!(kind.as_str(), "checkbox" | "radio") {
+            return self.leaf(node, style, 11.0, 11.0, Vec::new());
+        }
+        let is_button = matches!(kind.as_str(), "submit" | "button" | "reset");
+        let (size, bold) = (style.font_size, style.bold);
+        let metrics = self.fonts.metrics(size, bold);
+        let line = style.used_line_height(metrics.ascent + metrics.descent + metrics.line_gap);
+
+        let typed = self.values.get(&node).map(String::as_str);
+        let value = typed.or(element.attribute("value")).unwrap_or_default();
+        let (mut text, mut color) = (value.to_owned(), style.color);
+        if is_button && text.is_empty() {
+            text = match kind.as_str() {
+                "submit" => "Submit".to_owned(),
+                "reset" => "Reset".to_owned(),
+                _ => String::new(),
+            };
+        } else if kind == "password" {
+            text = "\u{2022}".repeat(value.chars().count());
+        }
+        if self.focused == Some(node) {
+            text.push('|');
+        } else if text.is_empty() && !is_button {
+            text = element
+                .attribute("placeholder")
+                .unwrap_or_default()
+                .to_owned();
+            color = PLACEHOLDER_COLOR;
+        }
+
+        let text_width = self.fonts.measure(&text, size, bold);
+        let columns = element
+            .attribute("size")
+            .and_then(|size| size.parse::<f32>().ok())
+            .filter(|columns| *columns > 0.0)
+            .unwrap_or(20.0);
+        let natural_width = if is_button {
+            text_width
+        } else {
+            self.fonts.measure("0", size, bold) * columns
+        };
+        let width = self.fixed_width(&style).unwrap_or(natural_width);
+        let height = match style.height {
+            Some(Length::Px(height)) => height,
+            _ => line,
+        };
+
+        let border = style.border();
+        let inset = match style.text_align {
+            TextAlign::Center => ((width - text_width) / 2.0).max(0.0),
+            _ => 0.0,
+        };
+        let top =
+            border.top + style.padding.top + (height - metrics.ascent - metrics.descent) / 2.0;
+        let fragment = Fragment {
+            node,
+            rect: Rect {
+                x: border.left + style.padding.left + inset,
+                y: top,
+                width: text_width,
+                height: metrics.ascent + metrics.descent,
+            },
+            baseline: top + metrics.ascent,
+            text,
+            size,
+            bold,
+            color,
+            underline: false,
+        };
+        let fragments = if fragment.text.is_empty() {
+            Vec::new()
+        } else {
+            vec![fragment]
+        };
+        self.leaf(node, style, width, height, fragments)
+    }
+
+    /// Lays out a table: columns are sized from their cells, then rows are stacked.
+    fn table(
+        &self,
+        node: NodeId,
+        containing_width: f32,
+        x: f32,
+        y: f32,
+        measuring: bool,
+    ) -> LayoutBox {
+        let style = *self.style(node);
+        let (border, padding, margin) = (style.border(), style.padding, margins(&style));
+        let frame = frame_width(&style);
+        let spacing = self
+            .doc
+            .element(node)
+            .and_then(|table| table.attribute("cellspacing")?.parse::<f32>().ok())
+            .filter(|spacing| *spacing >= 0.0)
+            .unwrap_or(DEFAULT_CELL_SPACING);
+
+        // Rows are direct children or sit one level down, inside a row group such as `tbody`.
+        let displayed = |parent: NodeId, display: Display| {
+            let children = self.doc.node(parent).children.iter().copied();
+            children.filter(move |&child| {
+                self.doc.element(child).is_some() && self.style(child).display == display
+            })
+        };
+        let mut rows: Vec<NodeId> = Vec::new();
+        for &child in &self.doc.node(node).children {
+            match self.style(child).display {
+                Display::TableRow if self.doc.element(child).is_some() => rows.push(child),
+                Display::Block => rows.extend(displayed(child, Display::TableRow)),
+                _ => {}
+            }
+        }
+        let cells: Vec<Vec<NodeId>> = rows
+            .iter()
+            .map(|&row| displayed(row, Display::TableCell).collect())
+            .collect();
+        let column_count = cells.iter().map(Vec::len).max().unwrap_or(0);
+
+        // What each column needs: its widest content, and the largest width any cell asks for.
+        let mut content = vec![0.0f32; column_count];
+        let mut percent = vec![0.0f32; column_count];
+        for row in &cells {
+            for (column, &cell) in row.iter().enumerate() {
+                let cell_style = self.style(cell);
+                let probe = self.block(cell, UNBOUNDED, 0.0, 0.0, None, true);
+                content[column] = content[column].max(probe.preferred_width);
+                match cell_style.width {
+                    Some(Length::Px(width)) => {
+                        content[column] = content[column].max(width + frame_width(cell_style));
+                    }
+                    Some(Length::Percent(share)) => {
+                        percent[column] = percent[column].max(share / 100.0)
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        let gaps = spacing * (column_count as f32 + 1.0);
+        let available = (containing_width - margin.left - margin.right - frame).max(0.0);
+        let percent_total = percent.iter().sum::<f32>().min(0.95);
+        let flexible: f32 = (0..column_count)
+            .filter(|&c| percent[c] == 0.0)
+            .map(|c| content[c])
+            .sum();
+        // The narrowest table in which every percentage column still fits its content.
+        let mut natural = flexible / (1.0 - percent_total);
+        for column in 0..column_count {
+            if percent[column] > 0.0 {
+                natural = natural.max(content[column] / percent[column]);
+            }
+        }
+        let natural = natural + gaps;
+        let width = match style.width {
+            Some(Length::Px(width)) => width.max(gaps),
+            Some(Length::Percent(share)) if !measuring => (available * share / 100.0).max(gaps),
+            _ if measuring => natural,
+            _ => natural.min(available),
+        };
+
+        let inner = (width - gaps).max(0.0);
+        let percent_width: f32 = percent.iter().map(|share| share * inner).sum();
+        let remaining = (inner - percent_width).max(0.0);
+        let flexible_count = percent.iter().filter(|share| **share == 0.0).count().max(1) as f32;
+        let column_widths: Vec<f32> = (0..column_count)
+            .map(|column| {
+                if percent[column] > 0.0 {
+                    percent[column] * inner
+                } else if flexible > 0.0 {
+                    remaining * content[column] / flexible
+                } else {
+                    remaining / flexible_count
+                }
+            })
+            .collect();
+
+        let rect_x = x + self.margin_left(node, containing_width, width + frame);
+        let content_x = rect_x + border.left + padding.left;
+        let content_y = y + border.top + padding.top;
+        let mut children = Vec::with_capacity(rows.len());
+        let mut cursor_y = content_y + spacing;
+        for (&row, row_cells) in rows.iter().zip(&cells) {
+            let mut cell_boxes = Vec::with_capacity(row_cells.len());
+            let mut cursor_x = content_x + spacing;
+            for (column, &cell) in row_cells.iter().enumerate() {
+                let column_width = column_widths[column];
+                let cell_width = (column_width - frame_width(self.style(cell))).max(0.0);
+                let mut cell_box = self.block(
+                    cell,
+                    column_width,
+                    cursor_x,
+                    cursor_y,
+                    Some(cell_width),
+                    measuring,
+                );
+                cell_box.translate(cursor_x - cell_box.rect.x, 0.0);
+                cell_boxes.push(cell_box);
+                cursor_x += column_width + spacing;
+            }
+            let row_style = *self.style(row);
+            let specified_height = match row_style.height {
+                Some(Length::Px(height)) => height,
+                _ => 0.0,
+            };
+            let row_height = cell_boxes
+                .iter()
+                .map(|c| c.rect.height)
+                .fold(specified_height, f32::max);
+            for cell_box in &mut cell_boxes {
+                let extra = row_height - cell_box.rect.height;
+                let shift = match cell_box.style.vertical_align {
+                    VerticalAlign::Middle => extra / 2.0,
+                    VerticalAlign::Bottom => extra,
+                    VerticalAlign::Top | VerticalAlign::Baseline => 0.0,
+                };
+                cell_box.translate_contents(0.0, shift);
+                cell_box.rect.height = row_height;
+            }
+            children.push(LayoutBox {
+                node: row,
+                rect: Rect {
+                    x: content_x,
+                    y: cursor_y,
+                    width,
+                    height: row_height,
+                },
+                style: row_style,
+                children: cell_boxes,
+                fragments: Vec::new(),
+                preferred_width: width,
+            });
+            cursor_y += row_height + spacing;
+        }
+
+        let rows_height = if rows.is_empty() {
+            0.0
+        } else {
+            cursor_y - content_y
+        };
+        let content_height = match style.height {
+            Some(Length::Px(height)) => height.max(rows_height),
+            _ => rows_height,
+        };
+        LayoutBox {
+            node,
+            rect: Rect {
+                x: rect_x,
+                y,
+                width: width + frame,
+                height: content_height + frame_height(&style),
+            },
+            style,
+            children,
+            fragments: Vec::new(),
+            preferred_width: width + frame + margin.left + margin.right,
+        }
+    }
+}
+
+/// Something waiting on the current line for the line to be finished.
+struct LineItem {
+    /// Offset from the start of the line.
     x: f32,
-    y: f32,
-) -> LayoutBox {
-    let style = styles[node.0];
-    let (border, padding) = (style.border(), style.padding);
-    let frame_width = border.left + padding.left + padding.right + border.right;
+    width: f32,
+    /// How far the item reaches above the baseline, including half of any extra line height.
+    ascent: f32,
+    /// How far it reaches below the baseline.
+    descent: f32,
+    kind: ItemKind,
+}
 
-    let (width, margin_left) = match style.width {
-        None => {
-            let margins = style.margin.left.unwrap_or(0.0) + style.margin.right.unwrap_or(0.0);
-            let width = (containing_width - margins - frame_width).max(0.0);
-            (width, style.margin.left.unwrap_or(0.0))
-        }
-        Some(width) => {
-            // Space left over once the box and its fixed margins are placed. Auto
-            // margins absorb it, and count as zero when there is none to absorb.
-            let free = |fixed_margins: f32| {
-                (containing_width - width - frame_width - fixed_margins).max(0.0)
-            };
-            let margin_left = match (style.margin.left, style.margin.right) {
-                (Some(left), _) => left,
-                (None, Some(right)) => free(right),
-                (None, None) => free(0.0) / 2.0,
-            };
-            (width, margin_left)
-        }
-    };
+enum ItemKind {
+    Text {
+        fragment: Fragment,
+        font_ascent: f32,
+    },
+    Box {
+        layout: Box<LayoutBox>,
+        margin: Edges<f32>,
+    },
+}
 
-    let rect_x = x + margin_left;
-    let rect_y = y + style.margin.top.unwrap_or(0.0);
-    let content_x = rect_x + border.left + padding.left;
-    let content_y = rect_y + border.top + padding.top;
+/// The state of one block container while its children are being placed.
+struct Flow<'c, 'a> {
+    context: &'c Context<'a>,
+    measuring: bool,
+    /// The left edge and width of the content box.
+    x: f32,
+    width: f32,
+    /// Where the next line or block goes.
+    cursor: f32,
+    /// The bottom margin of the previous block, which may collapse with the next top margin.
+    pending_margin: f32,
+    align: TextAlign,
+    /// The container's own font, which gives every line a minimum ascent and descent.
+    strut: (f32, f32),
+    space_width: f32,
+    line: Vec<LineItem>,
+    line_width: f32,
+    /// Whether collapsible whitespace was seen since the last item.
+    pending_space: bool,
+    children: Vec<LayoutBox>,
+    fragments: Vec<Fragment>,
+    /// The widest line or child seen, which is how wide the content wants to be.
+    extent: f32,
+}
 
-    let mut children = Vec::new();
-    let mut cursor = content_y;
-    for &child in &doc.node(node).children {
-        let child_style = &styles[child.0];
-        if doc.element(child).is_none() || child_style.display != Display::Block {
-            continue;
+impl<'c, 'a> Flow<'c, 'a> {
+    fn new(
+        context: &'c Context<'a>,
+        node: NodeId,
+        x: f32,
+        width: f32,
+        y: f32,
+        measuring: bool,
+    ) -> Self {
+        let style = context.style(node);
+        let (ascent, descent) = text_extent(context.fonts, style);
+        Self {
+            context,
+            measuring,
+            x,
+            width,
+            cursor: y,
+            pending_margin: 0.0,
+            align: style.text_align,
+            strut: (ascent, descent),
+            space_width: context.fonts.measure(" ", style.font_size, style.bold),
+            line: Vec::new(),
+            line_width: 0.0,
+            pending_space: false,
+            children: Vec::new(),
+            fragments: Vec::new(),
+            extent: 0.0,
         }
-        let child_box = block(doc, styles, child, width, content_x, cursor);
-        cursor =
-            child_box.rect.y + child_box.rect.height + child_style.margin.bottom.unwrap_or(0.0);
-        children.push(child_box);
     }
 
-    let content_height = style.height.unwrap_or(cursor - content_y);
-    LayoutBox {
-        node,
-        rect: Rect {
-            x: rect_x,
-            y: rect_y,
-            width: border.left + padding.left + width + padding.right + border.right,
-            height: border.top + padding.top + content_height + padding.bottom + border.bottom,
-        },
-        style,
-        children,
+    /// Makes room for `width` more on the line, breaking first if it does not fit.
+    /// Returns the gap to leave before the new item.
+    fn make_room(&mut self, width: f32, space: f32, may_break: bool) -> f32 {
+        let mut gap = if self.pending_space && !self.line.is_empty() {
+            space
+        } else {
+            0.0
+        };
+        if may_break
+            && !self.line.is_empty()
+            && self.line_width + gap + width > self.width + FIT_TOLERANCE
+        {
+            self.flush_line();
+            gap = 0.0;
+        }
+        if self.line.is_empty() {
+            // Inline content after a block starts below that block's bottom margin.
+            self.cursor += self.pending_margin;
+            self.pending_margin = 0.0;
+        }
+        self.pending_space = false;
+        gap
     }
+
+    fn text(&mut self, node: NodeId, text: &str, style: &Style) {
+        let fonts = self.context.fonts;
+        let (size, bold) = (style.font_size, style.bold);
+        let metrics = fonts.metrics(size, bold);
+        let (ascent, descent) = text_extent(fonts, style);
+        let space = fonts.measure(" ", size, bold);
+
+        if text.starts_with(|c: char| c.is_ascii_whitespace()) {
+            self.pending_space = true;
+        }
+        for (index, word) in text.split_ascii_whitespace().enumerate() {
+            if index > 0 {
+                self.pending_space = true;
+            }
+            let width = fonts.measure(word, size, bold);
+            let gap = self.make_room(width, space, !style.nowrap);
+            let continues = matches!(
+                self.line.last(),
+                Some(LineItem { kind: ItemKind::Text { fragment, .. }, .. }) if fragment.node == node
+            );
+            if continues
+                && let Some(LineItem {
+                    width: item_width,
+                    kind: ItemKind::Text { fragment, .. },
+                    ..
+                }) = self.line.last_mut()
+            {
+                // Consecutive words of one text node stay one run, which keeps painting cheap.
+                if gap > 0.0 {
+                    fragment.text.push(' ');
+                }
+                fragment.text.push_str(word);
+                *item_width += gap + width;
+            } else {
+                self.line.push(LineItem {
+                    x: self.line_width + gap,
+                    width,
+                    ascent,
+                    descent,
+                    kind: ItemKind::Text {
+                        fragment: Fragment {
+                            node,
+                            rect: Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 0.0,
+                                height: metrics.ascent + metrics.descent,
+                            },
+                            baseline: 0.0,
+                            text: word.to_owned(),
+                            size,
+                            bold,
+                            color: style.color,
+                            underline: style.underline,
+                        },
+                        font_ascent: metrics.ascent,
+                    },
+                });
+            }
+            self.line_width += gap + width;
+        }
+        if text.ends_with(|c: char| c.is_ascii_whitespace()) {
+            self.pending_space = true;
+        }
+    }
+
+    /// Places a box that behaves like one large character.
+    fn atomic(&mut self, layout: LayoutBox, margin: Edges<f32>, nowrap: bool) {
+        let width = layout.rect.width + margin.left + margin.right;
+        let gap = self.make_room(width, self.space_width, !nowrap);
+        self.line.push(LineItem {
+            x: self.line_width + gap,
+            width,
+            // The bottom margin edge sits on the baseline.
+            ascent: layout.rect.height + margin.top + margin.bottom,
+            descent: 0.0,
+            kind: ItemKind::Box {
+                layout: Box::new(layout),
+                margin,
+            },
+        });
+        self.line_width += gap + width;
+    }
+
+    /// A forced break. On an empty line it still takes up one line of the break's own height.
+    fn line_break(&mut self, style: &Style) {
+        if self.line.is_empty() {
+            let (ascent, descent) = text_extent(self.context.fonts, style);
+            self.cursor += self.pending_margin + ascent + descent;
+            self.pending_margin = 0.0;
+            self.pending_space = false;
+        } else {
+            self.flush_line();
+        }
+    }
+
+    fn block_child(&mut self, node: NodeId) {
+        self.flush_line();
+        let margin = margins(self.context.style(node));
+        let y = self.cursor + collapse(self.pending_margin, margin.top);
+        let child = self
+            .context
+            .flow_box(node, self.width, self.x, y, self.measuring);
+        self.cursor = child.rect.y + child.rect.height;
+        self.pending_margin = margin.bottom;
+        self.extent = self.extent.max(child.preferred_width);
+        self.children.push(child);
+    }
+
+    /// Finishes the current line: aligns it, sets its height and positions everything on it.
+    fn flush_line(&mut self) {
+        self.pending_space = false;
+        if self.line.is_empty() {
+            return;
+        }
+        let ascent = self
+            .line
+            .iter()
+            .map(|item| item.ascent)
+            .fold(self.strut.0, f32::max);
+        let descent = self
+            .line
+            .iter()
+            .map(|item| item.descent)
+            .fold(self.strut.1, f32::max);
+        let free = (self.width - self.line_width).max(0.0);
+        let offset = match self.align {
+            _ if self.measuring => 0.0,
+            TextAlign::Left => 0.0,
+            TextAlign::Center => free / 2.0,
+            TextAlign::Right => free,
+        };
+        let baseline = self.cursor + ascent;
+        for item in self.line.drain(..) {
+            let x = self.x + offset + item.x;
+            match item.kind {
+                ItemKind::Text {
+                    mut fragment,
+                    font_ascent,
+                } => {
+                    fragment.rect.x = x;
+                    fragment.rect.y = baseline - font_ascent;
+                    fragment.rect.width = item.width;
+                    fragment.baseline = baseline;
+                    self.fragments.push(fragment);
+                }
+                ItemKind::Box { mut layout, margin } => {
+                    let top = baseline - item.ascent + margin.top;
+                    layout.translate(x + margin.left - layout.rect.x, top - layout.rect.y);
+                    self.children.push(*layout);
+                }
+            }
+        }
+        self.extent = self.extent.max(self.line_width);
+        self.cursor += ascent + descent;
+        self.line_width = 0.0;
+    }
+
+    /// Returns the child boxes, the text, the bottom of the content and the preferred width.
+    fn finish(mut self) -> (Vec<LayoutBox>, Vec<Fragment>, f32, f32) {
+        self.flush_line();
+        // The last child's bottom margin stays inside this box.
+        let bottom = self.cursor + self.pending_margin;
+        (self.children, self.fragments, bottom, self.extent)
+    }
+}
+
+/// How far text in this style reaches above and below the baseline, with the
+/// line height's extra space split evenly between the two.
+fn text_extent(fonts: &Fonts, style: &Style) -> (f32, f32) {
+    let metrics = fonts.metrics(style.font_size, style.bold);
+    let content = metrics.ascent + metrics.descent;
+    let half_leading = (style.used_line_height(content + metrics.line_gap) - content) / 2.0;
+    (
+        metrics.ascent + half_leading,
+        metrics.descent + half_leading,
+    )
 }
 
 #[cfg(test)]
@@ -125,13 +970,38 @@ mod tests {
     use super::*;
     use crate::{html, style};
 
-    /// Lays out `html` at 800px wide and returns the border box of the first element named `tag`.
-    fn rect_of(html: &str, tag: &str) -> Option<(f32, f32, f32, f32)> {
+    /// Lays out `html` at 800px wide and hands the tree to `check`.
+    fn with_layout<T>(html: &str, check: impl FnOnce(&Document, &LayoutBox) -> T) -> Option<T> {
         let doc = html::parse(html);
-        let styles = style::compute(&doc);
-        let root = layout(&doc, &styles, 800.0)?;
-        let rect = root.find(doc.find_element(tag)?)?.rect;
-        Some((rect.x, rect.y, rect.width, rect.height))
+        let styles = style::compute(&doc, &HashMap::new());
+        let context = Context {
+            doc: &doc,
+            styles: &styles,
+            fonts: Fonts::system(),
+            image_sizes: &HashMap::new(),
+            values: &HashMap::new(),
+            focused: None,
+        };
+        let root = layout(context, 800.0)?;
+        Some(check(&doc, &root))
+    }
+
+    /// The border box of the first element named `tag`.
+    fn rect_of(html: &str, tag: &str) -> Option<(f32, f32, f32, f32)> {
+        with_layout(html, |doc, root| {
+            let rect = root.find(doc.find_element(tag)?)?.rect;
+            Some((rect.x, rect.y, rect.width, rect.height))
+        })
+        .flatten()
+    }
+
+    /// Every text run in the tree, in paint order.
+    fn runs(root: &LayoutBox) -> Vec<Fragment> {
+        let mut all = root.fragments.clone();
+        for child in &root.children {
+            all.extend(runs(child));
+        }
+        all
     }
 
     #[test]
@@ -154,24 +1024,177 @@ mod tests {
 
         let too_wide = "<div style='width: 900px; height: 10px; margin: 0 auto'></div>";
         assert_eq!(rect_of(too_wide, "div"), Some((8.0, 8.0, 900.0, 10.0)));
+
+        let percent = "<div style='width: 50%; height: 10px'></div>";
+        assert_eq!(rect_of(percent, "div"), Some((8.0, 8.0, 392.0, 10.0)));
+
+        let capped = "<div style='max-width: 200px; height: 10px; margin: 0 auto'></div>";
+        assert_eq!(rect_of(capped, "div"), Some((300.0, 8.0, 200.0, 10.0)));
     }
 
     #[test]
-    fn siblings_stack_and_parents_grow_to_fit() {
+    fn siblings_stack_and_their_margins_collapse() {
         let html = "<section style='padding: 10px'>\
                     <div style='height: 20px; margin-bottom: 5px'></div>\
-                    <article style='height: 30px'></article></section>";
+                    <article style='height: 30px; margin-top: 12px'></article></section>";
         assert_eq!(rect_of(html, "div"), Some((18.0, 18.0, 764.0, 20.0)));
-        assert_eq!(rect_of(html, "article"), Some((18.0, 43.0, 764.0, 30.0)));
-        assert_eq!(rect_of(html, "section"), Some((8.0, 8.0, 784.0, 75.0)));
+        assert_eq!(rect_of(html, "article"), Some((18.0, 50.0, 764.0, 30.0)));
+        assert_eq!(rect_of(html, "section"), Some((8.0, 8.0, 784.0, 82.0)));
     }
 
     #[test]
-    fn hidden_and_inline_elements_generate_no_box() {
-        let html = "<div style='display: none; height: 10px'></div><span></span>\
+    fn hidden_elements_generate_no_box_and_whitespace_takes_no_space() {
+        let html = "<div style='display: none; height: 10px'></div>\n  <span> </span>\n\
                     <section style='height: 5px'></section>";
         assert_eq!(rect_of(html, "div"), None);
-        assert_eq!(rect_of(html, "span"), None);
         assert_eq!(rect_of(html, "section"), Some((8.0, 8.0, 784.0, 5.0)));
+    }
+
+    #[test]
+    fn the_center_element_centers_blocks_with_a_width() {
+        let html = "<center><div style='width: 100px; height: 10px'></div></center>";
+        assert_eq!(rect_of(html, "div"), Some((350.0, 8.0, 100.0, 10.0)));
+    }
+
+    #[test]
+    fn text_wraps_at_spaces_and_lines_stack() {
+        if !Fonts::system().available() {
+            return;
+        }
+        let html = "<div style='width: 120px'>alpha beta gamma delta epsilon zeta eta theta</div>";
+        with_layout(html, |_, root| {
+            let lines = runs(root);
+            assert!(lines.len() > 2, "{lines:?}");
+            assert!(lines.iter().all(|line| line.rect.width <= 120.0));
+            assert!(lines.windows(2).all(|pair| pair[1].rect.y > pair[0].rect.y));
+            assert!(lines.iter().all(|line| line.rect.x == 8.0));
+            let text: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+            assert_eq!(
+                text.join(" "),
+                "alpha beta gamma delta epsilon zeta eta theta"
+            );
+        });
+    }
+
+    #[test]
+    fn whitespace_collapses_across_inline_elements() {
+        if !Fonts::system().available() {
+            return;
+        }
+        let html = "<p>one   <b> two</b>\n three</p>";
+        with_layout(html, |_, root| {
+            let line = runs(root);
+            let text: Vec<&str> = line.iter().map(|run| run.text.as_str()).collect();
+            assert_eq!(text, ["one", "two", "three"]);
+            assert!(line[1].bold && !line[0].bold);
+            assert_eq!(line[0].baseline, line[2].baseline);
+            let space = Fonts::system().measure(" ", 16.0, false);
+            let gap = line[1].rect.x - (line[0].rect.x + line[0].rect.width);
+            assert!((gap - space).abs() < 0.01, "{gap} vs {space}");
+        });
+    }
+
+    #[test]
+    fn text_align_moves_lines_and_nowrap_keeps_them_whole() {
+        if !Fonts::system().available() {
+            return;
+        }
+        with_layout("<div style='text-align: center'>mid</div>", |_, root| {
+            let run = &runs(root)[0];
+            let center = run.rect.x + run.rect.width / 2.0;
+            assert!((center - 400.0).abs() < 0.01, "{center}");
+        });
+        with_layout(
+            "<div style='width: 20px; white-space: nowrap'>one two three</div>",
+            |_, root| {
+                assert_eq!(runs(root).len(), 1);
+            },
+        );
+    }
+
+    #[test]
+    fn line_breaks_and_blocks_inside_inlines_start_new_lines() {
+        if !Fonts::system().available() {
+            return;
+        }
+        with_layout("<span>a<br>b<div>c</div>d</span>", |_, root| {
+            let mut lines = runs(root);
+            // Text in the nested block is collected after its parent's, so order by content.
+            lines.sort_by(|a, b| a.text.cmp(&b.text));
+            let ys: Vec<f32> = lines.iter().map(|line| line.rect.y).collect();
+            assert_eq!(lines.len(), 4);
+            assert!(ys.windows(2).all(|pair| pair[1] > pair[0]), "{ys:?}");
+        });
+    }
+
+    #[test]
+    fn inline_blocks_shrink_to_their_content_and_share_a_line() {
+        let html = "<span style='display: inline-block; height: 20px; padding: 0 5px'>\
+                    <div style='width: 50px; height: 20px'></div></span>\
+                    <article style='display: inline-block; width: 30px; height: 10px'></article>";
+        assert_eq!(
+            rect_of(html, "span").map(|r| (r.0, r.2, r.3)),
+            Some((8.0, 60.0, 20.0))
+        );
+        let article = rect_of(html, "article");
+        assert_eq!(article.map(|r| (r.0, r.2, r.3)), Some((68.0, 30.0, 10.0)));
+        // Both sit on the same baseline, so the shorter box is lower.
+        let span_bottom = rect_of(html, "span").map(|r| r.1 + r.3);
+        assert_eq!(article.map(|r| r.1 + r.3), span_bottom);
+    }
+
+    #[test]
+    fn images_take_their_markup_size_and_inputs_have_a_default_one() {
+        let image = "<img width=272 height=92 style='padding: 28px 0 14px'>";
+        assert_eq!(
+            rect_of(image, "img").map(|r| (r.2, r.3)),
+            Some((272.0, 134.0))
+        );
+        if Fonts::system().available() {
+            let input = rect_of("<input value=hello>", "input");
+            assert!(
+                input.is_some_and(|r| r.2 > 100.0 && r.3 > 14.0),
+                "{input:?}"
+            );
+            assert_eq!(rect_of("<input type=hidden>", "input"), None);
+        }
+    }
+
+    #[test]
+    fn table_columns_follow_percentages_and_content() {
+        let html = "<table cellspacing=0 style='width: 400px'><tr>\
+                    <td width='25%' style='padding: 0'></td>\
+                    <td style='padding: 0'><div style='width: 100px; height: 30px'></div></td>\
+                    <th width='25%' style='padding: 0'><div style='height: 10px'></div></th>\
+                    </tr></table>";
+        assert_eq!(rect_of(html, "table"), Some((8.0, 8.0, 400.0, 30.0)));
+        assert_eq!(rect_of(html, "td"), Some((8.0, 8.0, 100.0, 30.0)));
+        assert_eq!(rect_of(html, "th"), Some((308.0, 8.0, 100.0, 30.0)));
+        // The short cell's content is centred vertically in the taller row.
+        let inner = with_layout(html, |doc, root| {
+            let cell = root.find(doc.find_element("th")?)?;
+            Some(cell.children[0].rect.y)
+        });
+        assert_eq!(inner.flatten(), Some(18.0));
+    }
+
+    #[test]
+    fn an_auto_table_is_as_wide_as_its_content_needs() {
+        let html = "<table cellspacing=0><tr>\
+                    <td width='25%' style='padding: 0'></td>\
+                    <td style='padding: 0'><div style='width: 100px; height: 30px'></div></td>\
+                    <td width='25%' style='padding: 0'></td></tr></table>";
+        assert_eq!(rect_of(html, "table"), Some((8.0, 8.0, 200.0, 30.0)));
+    }
+
+    #[test]
+    fn hit_testing_finds_the_innermost_box() {
+        let html =
+            "<div style='height: 40px'><section style='width: 20px; height: 20px'></section></div>";
+        with_layout(html, |doc, root| {
+            assert_eq!(root.hit_test(10.0, 10.0), doc.find_element("section"));
+            assert_eq!(root.hit_test(100.0, 10.0), doc.find_element("div"));
+            assert_eq!(root.hit_test(100.0, 500.0), None);
+        });
     }
 }

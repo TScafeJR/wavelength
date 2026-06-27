@@ -19,6 +19,43 @@ const ESCAPABLE_RAW_TEXT: &[&str] = &["textarea", "title"];
 /// Elements that go into `head` when they appear before any body content.
 const HEAD_ONLY: &[&str] = &["base", "link", "meta", "script", "style", "title"];
 
+/// Elements whose start tag ends an open paragraph.
+const CLOSES_PARAGRAPH: &[&str] = &[
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "center",
+    "dd",
+    "details",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "menu",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "ul",
+];
+
 /// Parses a document. Parsing never fails; unrecognised input is skipped.
 pub fn parse(input: &str) -> Document {
     let mut doc = Document::new();
@@ -143,6 +180,7 @@ impl<'a> Parser<'a> {
             self.head
         } else {
             self.in_body = true;
+            self.close_implied(name);
             self.current()
         };
         let id = self.doc.append(parent, element(name, attributes));
@@ -159,6 +197,39 @@ impl<'a> Parser<'a> {
             }
         } else if !VOID.contains(&name) {
             self.open.push(id);
+        }
+    }
+
+    /// Ends the elements a new start tag closes implicitly: the previous list
+    /// item, table cell or row, and any open paragraph before a block.
+    fn close_implied(&mut self, name: &str) {
+        let (targets, boundaries): (&[&str], &[&str]) = match name {
+            "li" => (&["li"], &["ul", "ol", "table"]),
+            "dt" | "dd" => (&["dt", "dd"], &["dl", "table"]),
+            "tr" => (&["tr"], &["table"]),
+            "td" | "th" => (&["td", "th"], &["tr", "table"]),
+            "option" => (&["option"], &["select"]),
+            _ => (&[], &[]),
+        };
+        self.close_nearest(targets, boundaries);
+        if CLOSES_PARAGRAPH.contains(&name) {
+            self.close_nearest(&["p"], &["table", "td", "th", "button", "caption"]);
+        }
+    }
+
+    /// Closes the innermost open element named in `targets`, unless one of `boundaries` is met first.
+    fn close_nearest(&mut self, targets: &[&str], boundaries: &[&str]) {
+        for index in (0..self.open.len()).rev() {
+            let Some(element) = self.doc.element(self.open[index]) else {
+                continue;
+            };
+            if targets.contains(&element.name.as_str()) {
+                self.open.truncate(index);
+                return;
+            }
+            if boundaries.contains(&element.name.as_str()) {
+                return;
+            }
         }
     }
 
@@ -314,6 +385,23 @@ fn entity(name: &str) -> Option<char> {
         "quot" => Some('"'),
         "apos" => Some('\''),
         "nbsp" => Some('\u{a0}'),
+        "copy" => Some('\u{a9}'),
+        "reg" => Some('\u{ae}'),
+        "trade" => Some('\u{2122}'),
+        "middot" => Some('\u{b7}'),
+        "bull" => Some('\u{2022}'),
+        "hellip" => Some('\u{2026}'),
+        "ndash" => Some('\u{2013}'),
+        "mdash" => Some('\u{2014}'),
+        "lsquo" => Some('\u{2018}'),
+        "rsquo" => Some('\u{2019}'),
+        "ldquo" => Some('\u{201c}'),
+        "rdquo" => Some('\u{201d}'),
+        "laquo" => Some('\u{ab}'),
+        "raquo" => Some('\u{bb}'),
+        "times" => Some('\u{d7}'),
+        "euro" => Some('\u{20ac}'),
+        "pound" => Some('\u{a3}'),
         _ => {
             let code = name.strip_prefix('#')?;
             let value = match code.strip_prefix(['x', 'X']) {
@@ -414,6 +502,22 @@ mod tests {
         assert_eq!(
             parsed("<p>a<!-- <b> -->&lt;b&#33;&#x21;&unknown; é</p>"),
             "<html><head></><body><p>'a<b!!&unknown; é'</></></>"
+        );
+    }
+
+    #[test]
+    fn list_items_cells_and_paragraphs_close_implicitly() {
+        assert_eq!(
+            parsed("<ul><li>a<li>b<ul><li>c</ul><li>d</ul>"),
+            "<html><head></><body><ul><li>'a'</><li>'b'<ul><li>'c'</></></><li>'d'</></></></>"
+        );
+        assert_eq!(
+            parsed("<dl><dt>t<dd>d<dt>u</dl><p>one<p>two<div>three</div>"),
+            "<html><head></><body><dl><dt>'t'</><dd>'d'</><dt>'u'</></><p>'one'</><p>'two'</><div>'three'</></></>"
+        );
+        assert_eq!(
+            parsed("<table><tr><td>a<td>b<tr><td><p>c</table>"),
+            "<html><head></><body><table><tr><td>'a'</><td>'b'</></><tr><td><p>'c'</></></></></></>"
         );
     }
 

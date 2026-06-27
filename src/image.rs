@@ -1,7 +1,7 @@
 //! An RGBA bitmap that can be read from and written to PNG files.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Seek};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -72,14 +72,27 @@ impl Image {
 
     /// Reads a PNG file, converting it to 8-bit RGBA.
     pub fn load(path: &Path) -> Result<Self> {
-        let mut decoder = png::Decoder::new(BufReader::new(File::open(path)?));
+        Self::read(
+            BufReader::new(File::open(path)?),
+            &path.display().to_string(),
+        )
+    }
+
+    /// Decodes PNG data held in memory. Other image formats are not supported yet.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        Self::read(Cursor::new(bytes), "image data")
+    }
+
+    fn read(source: impl BufRead + Seek, name: &str) -> Result<Self> {
+        let failed = |error: &dyn std::fmt::Display| Error::Image(format!("{name}: {error}"));
+        let mut decoder = png::Decoder::new(source);
         decoder.set_transformations(png::Transformations::normalize_to_color8());
-        let mut reader = decoder.read_info().map_err(image_error(path))?;
+        let mut reader = decoder.read_info().map_err(|e| failed(&e))?;
         let size = reader
             .output_buffer_size()
-            .ok_or_else(|| Error::Image(format!("{}: image is too large", path.display())))?;
+            .ok_or_else(|| failed(&"image is too large"))?;
         let mut buffer = vec![0; size];
-        let info = reader.next_frame(&mut buffer).map_err(image_error(path))?;
+        let info = reader.next_frame(&mut buffer).map_err(|e| failed(&e))?;
         buffer.truncate(info.buffer_size());
         let pixels = match info.color_type {
             png::ColorType::Rgba => buffer,
@@ -92,18 +105,39 @@ impl Image {
                 .chunks_exact(2)
                 .flat_map(|p| [p[0], p[0], p[0], p[1]])
                 .collect(),
-            png::ColorType::Indexed => {
-                return Err(Error::Image(format!(
-                    "{}: palette was not expanded",
-                    path.display()
-                )));
-            }
+            png::ColorType::Indexed => return Err(failed(&"palette was not expanded")),
         };
         Ok(Self {
             width: info.width,
             height: info.height,
             pixels,
         })
+    }
+
+    /// The raw pixels, row by row, four bytes each in RGBA order.
+    pub fn data(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// Draws one pixel over what is already there. `coverage` scales the colour's own alpha.
+    ///
+    /// Coordinates outside the image are ignored. The image itself stays opaque.
+    pub fn blend(&mut self, x: i64, y: i64, rgba: [u8; 4], coverage: u8) {
+        if x < 0 || y < 0 || x >= i64::from(self.width) || y >= i64::from(self.height) {
+            return;
+        }
+        let alpha = u32::from(rgba[3]) * u32::from(coverage);
+        if alpha == 0 {
+            return;
+        }
+        let start = (y as usize * self.width as usize + x as usize) * 4;
+        for (target, &source) in self.pixels[start..start + 3].iter_mut().zip(&rgba[..3]) {
+            let (source, current) = (u32::from(source), u32::from(*target));
+            let mixed =
+                (source * alpha + current * (255 * 255 - alpha) + 255 * 255 / 2) / (255 * 255);
+            *target = mixed as u8;
+        }
+        self.pixels[start + 3] = 255;
     }
 }
 

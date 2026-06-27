@@ -10,9 +10,16 @@ keywords = ["browser", "engine", "html", "css", "layout"]
 categories = ["web-programming", "rendering"]
 
 # Versions are pinned exactly and the dependency list is kept short on purpose.
-# The engine itself uses none; `png` only reads and writes image files.
+# The engine itself uses none; `png` only reads and writes image files, and
+# `minifb` opens the window for the optional `browse` command.
 [dependencies]
 png = "=0.18.1"
+minifb = { version = "=0.29.0", default-features = false, features = ["x11"], optional = true }
+
+[features]
+# The `browse` command: a window with an address bar. Off by default so the
+# engine builds on machines without a display or windowing libraries.
+window = ["dep:minifb"]
 
 [lints.rust]
 unsafe_code = "forbid"
