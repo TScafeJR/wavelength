@@ -45,6 +45,8 @@ pub struct Page {
     /// The URL relative references resolve against, when the page has one.
     base_url: Option<String>,
     images: HashMap<NodeId, Image>,
+    /// The text of each linked stylesheet, kept so styles can be recomputed when the viewport changes.
+    stylesheets: HashMap<NodeId, String>,
     /// Text typed into form fields.
     values: HashMap<NodeId, String>,
     focused: Option<NodeId>,
@@ -75,33 +77,14 @@ impl Page {
         let document = html::parse(html);
         let mut stylesheets = HashMap::new();
         let mut images = HashMap::new();
-        for id in document.ids() {
-            let Some(element) = document.element(id) else {
+        for (id, is_stylesheet, resource) in resource_references(&document, base_url) {
+            let Some(bytes) = loader(&resource) else {
                 continue;
             };
-            let mut load = |attribute: &str| {
-                let reference = element
-                    .attribute(attribute)
-                    .filter(|value| !value.is_empty())?;
-                loader(&url::resolve(base_url, reference)?)
-            };
-            match element.name.as_str() {
-                "link" => {
-                    let relation = element.attribute("rel").unwrap_or_default();
-                    let is_stylesheet = relation
-                        .split_ascii_whitespace()
-                        .any(|token| token.eq_ignore_ascii_case("stylesheet"));
-                    if is_stylesheet && let Some(bytes) = load("href") {
-                        stylesheets.insert(id, String::from_utf8_lossy(&bytes).into_owned());
-                    }
-                }
-                "img" => {
-                    if let Some(picture) = load("src").and_then(|bytes| Image::decode(&bytes).ok())
-                    {
-                        images.insert(id, picture);
-                    }
-                }
-                _ => {}
+            if is_stylesheet {
+                stylesheets.insert(id, String::from_utf8_lossy(&bytes).into_owned());
+            } else if let Ok(picture) = Image::decode(&bytes) {
+                images.insert(id, picture);
             }
         }
         Self::build(
@@ -115,16 +98,26 @@ impl Page {
 
     /// Fetches the page at `target` and everything it refers to.
     ///
-    /// `target` is an `http`, `https` or `file` URL. Resources are fetched one at a time.
+    /// `target` is an `http`, `https` or `file` URL. Resources are fetched in parallel.
     pub fn fetch(target: &str, viewport: Viewport) -> Result<Self> {
         let response = net::fetch(target)?;
-        let mut loader = |resource: &str| net::fetch(resource).ok().map(|response| response.body);
-        Ok(Self::open(
-            &response.text(),
-            &response.url,
-            viewport,
-            &mut loader,
-        ))
+        let html = response.text();
+        let fetched = net::fetch_all(&Self::resource_urls(&html, &response.url));
+        let mut loader = |resource: &str| fetched.get(resource).cloned().flatten();
+        Ok(Self::open(&html, &response.url, viewport, &mut loader))
+    }
+
+    /// The absolute URLs of the stylesheets and images a page refers to, without duplicates.
+    ///
+    /// Fetching these ahead of [`Page::open`] lets a caller load them in parallel.
+    pub fn resource_urls(html: &str, base_url: &str) -> Vec<String> {
+        let mut urls: Vec<String> = Vec::new();
+        for (_, _, resource) in resource_references(&html::parse(html), base_url) {
+            if !urls.contains(&resource) {
+                urls.push(resource);
+            }
+        }
+        urls
     }
 
     fn build(
@@ -134,10 +127,12 @@ impl Page {
         stylesheets: HashMap<NodeId, String>,
         images: HashMap<NodeId, Image>,
     ) -> Self {
-        let styles = style::compute(&document, &stylesheets);
+        let size = (viewport.width as f32, viewport.height as f32);
+        let styles = style::compute(&document, &stylesheets, size);
         let mut page = Self {
             document,
             styles,
+            stylesheets,
             layout: None,
             viewport,
             base_url,
@@ -180,6 +175,9 @@ impl Page {
     pub fn resize(&mut self, viewport: Viewport) {
         if viewport != self.viewport {
             self.viewport = viewport;
+            // Media queries and viewport units depend on the size, so styles are computed again.
+            let size = (viewport.width as f32, viewport.height as f32);
+            self.styles = style::compute(&self.document, &self.stylesheets, size);
             self.relayout();
         }
     }
@@ -392,6 +390,38 @@ impl Page {
     }
 }
 
+/// The stylesheets and images a document refers to: the element, whether it
+/// is a stylesheet, and the absolute URL.
+fn resource_references(document: &Document, base_url: &str) -> Vec<(NodeId, bool, String)> {
+    let mut references = Vec::new();
+    for id in document.ids() {
+        let Some(element) = document.element(id) else {
+            continue;
+        };
+        let (attribute, is_stylesheet) = match element.name.as_str() {
+            "link" => {
+                let relation = element.attribute("rel").unwrap_or_default();
+                let is_stylesheet = relation
+                    .split_ascii_whitespace()
+                    .any(|token| token.eq_ignore_ascii_case("stylesheet"));
+                if !is_stylesheet {
+                    continue;
+                }
+                ("href", true)
+            }
+            "img" => ("src", false),
+            _ => continue,
+        };
+        let reference = element
+            .attribute(attribute)
+            .filter(|value| !value.is_empty());
+        if let Some(resource) = reference.and_then(|reference| url::resolve(base_url, reference)) {
+            references.push((id, is_stylesheet, resource));
+        }
+    }
+    references
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,7 +436,11 @@ mod tests {
         let cards = page.select(".card")?;
         assert_eq!(cards.len(), 3);
         assert_eq!(page.select("div.wide, span")?, cards[1..]);
-        assert!(matches!(page.select("div > span"), Err(Error::Selector(_))));
+        assert_eq!(page.select("body > span")?, cards[2..]);
+        assert!(matches!(
+            page.select("div >> span"),
+            Err(Error::Selector(_))
+        ));
         Ok(())
     }
 

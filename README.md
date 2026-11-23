@@ -4,7 +4,7 @@
 
 A browser engine written from scratch in Rust, with one measure of progress: render a page, overlay the result on Chrome's screenshot of the same page, and count the pixels that differ. The long-term goal is an engine small and fast enough to embed in AI agents, which is why everything it knows about a page is already exposed through a small library API.
 
-The engine parses HTML and CSS, runs the cascade, lays out blocks, text, inline-blocks, form controls and simple tables, and paints them with its own TrueType rasteriser. It can load pages over HTTP and HTTPS, and on macOS it comes with a window that has an address bar, so you can type `google.com` and see the page drawn by the engine. It does not run JavaScript and it knows only part of CSS, so most modern sites look plain or incomplete. [ROADMAP.md](ROADMAP.md) lists what is missing and the order it will be built in.
+The engine parses HTML and CSS, runs a cascade with media queries and custom properties, lays out blocks, text, flex containers, form controls and simple tables, and paints them with its own TrueType rasteriser. It can load pages over HTTP and HTTPS, and on macOS it comes with a window that has an address bar, so you can type `google.com` and see the page drawn by the engine. It does not run JavaScript, and it has no grid, floats or positioning yet, so many modern sites still look incomplete. [ROADMAP.md](ROADMAP.md) lists what is missing and the order it will be built in.
 
 ![A spectrum of coloured bars rendered by the engine](assets/spectrum.png)
 
@@ -36,7 +36,7 @@ Each tab keeps its own back and forward list, which the `<` and `>` buttons or C
 
 Cmd+T opens a tab, Cmd+W closes the current one, Cmd+1 to Cmd+9 and Ctrl+Tab switch between them, and holding Cmd while clicking a link opens it in a new tab. Cmd+L focuses the address bar and Cmd+R reloads.
 
-Loading is synchronous, so the window does not respond while a page is being fetched. Requests send a generic user agent and no cookies, and nothing is kept between pages. Many sites, Google among them, answer an unknown browser with a simpler page, which is the version the engine can draw. Google's search results need JavaScript, so searching from its home page leads to a page that says so.
+Loading is synchronous, so the window does not respond while a page is being fetched, though a page's images and stylesheets are fetched in parallel. Requests send a generic user agent and no cookies, and nothing is kept between pages. Many sites, Google among them, answer an unknown browser with a simpler page, which is the version the engine can draw. Google's search results need JavaScript, so searching from its home page leads to a page that says so.
 
 ### The parity report
 
@@ -69,15 +69,17 @@ The pipeline is a straight line, and each stage is one module in `src/`.
 |---|---|---|
 | Fetch | `net.rs`, `url.rs` | HTTP, HTTPS and local files, URL resolution, form encoding |
 | Parse HTML | `html.rs`, `dom.rs` | Tags, attributes, text, raw-text elements, implied `html`, `head` and `body`, implied end tags for list items, cells and paragraphs |
-| Parse CSS | `css.rs` | Style rules with type, class, id and descendant selectors, specificity, `!important` |
-| Cascade | `style.rs` | User-agent sheet, linked and embedded stylesheets, `style` attributes, legacy attributes such as `bgcolor`, inheritance for text properties |
-| Fonts | `font.rs` | TrueType parsing, text measurement, antialiased glyph rasterisation |
-| Layout | `layout.rs` | Block flow with sibling margin collapsing, line breaking, inline-blocks, images, form controls, simplified tables |
-| Paint | `paint.rs`, `image.rs` | Backgrounds, per-side borders, text, PNG images, alpha blending |
+| Parse CSS | `css.rs` | Style rules, media queries, selectors with all four combinators, attribute tests and structural pseudo-classes, specificity |
+| Cascade | `style.rs` | User-agent sheet, linked and embedded stylesheets, `style` attributes, `!important`, custom properties and `var()`, `calc()`, viewport units, `inherit` and `initial`, legacy attributes such as `bgcolor` |
+| Fonts | `font.rs` | TrueType parsing, text measurement, antialiased glyph rasterisation, regular, bold and italic faces |
+| Layout | `layout.rs` | Block flow with sibling margin collapsing, line breaking, inline-blocks, flex rows and columns, `box-sizing`, size limits, list markers, images, form controls, simplified tables |
+| Paint | `paint.rs`, `image.rs` | Backgrounds, per-side borders, rounded corners, opacity, text, PNG images, alpha blending |
 | Window | `browse.rs`, `session.rs` | Tabs, address bar, back and forward, a history page, scrolling, links, form fields (optional `window` feature) |
 | Verify | `chrome.rs`, `diff.rs`, `report.rs` | Chrome reference screenshots, pixel diff, HTML report |
 
-One sans-serif family stands in for every font a page asks for: Arial on macOS, Liberation Sans or DejaVu Sans on Linux. Set `WAVELENGTH_FONT` and `WAVELENGTH_FONT_BOLD` to `.ttf` files to use others.
+One sans-serif family stands in for every font a page asks for: Arial on macOS, Liberation Sans or DejaVu Sans on Linux. Set `WAVELENGTH_FONT`, `WAVELENGTH_FONT_BOLD`, `WAVELENGTH_FONT_ITALIC` and `WAVELENGTH_FONT_BOLD_ITALIC` to `.ttf` files to use others.
+
+`demos/styled.html` is a page written to exercise the style engine: custom properties, flex layouts, rounded cards, a media query that restacks it on a narrow window, and selectors such as `:nth-child` and `[data-state]`. Open it with `make browse URL=demos/styled.html` and resize the window to see the layout change.
 
 ## Development
 

@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wavelength style demo</title>
+<style>
+  :root {
+    --ink: hsl(220, 25%, 14%);
+    --muted: hsl(220, 10%, 42%);
+    --brand: #5b4bdb;
+    --surface: #ffffff;
+    --line: hsl(220, 16%, 88%);
+    --radius: 12px;
+    --gap: 20px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: hsl(220, 20%, 96%); color: var(--ink); font: 15px/1.55 system-ui, sans-serif; }
+  a { color: var(--brand); text-decoration: none; }
+
+  header.bar { display: flex; align-items: center; gap: 28px; padding: 14px 90px; background: var(--ink); }
+  .bar .logo { color: #fff; font-weight: 700; font-size: 18px; letter-spacing: 0; }
+  .bar nav { display: flex; gap: 22px; }
+  .bar nav a { color: hsl(220, 20%, 78%); }
+  .bar nav a:first-child { color: #fff; }
+  .bar .cta { margin-left: auto; background: var(--brand); color: #fff; padding: 8px 18px; border-radius: 999px; font-weight: 600; }
+
+  main { max-width: 920px; margin: 0 auto; padding: 36px 0 60px; }
+  .eyebrow { text-transform: uppercase; font-size: 12px; font-weight: 700; color: var(--brand); }
+  h1 { font-size: 34px; line-height: 1.2; margin: 6px 0 10px; }
+  .lede { color: var(--muted); font-size: 17px; max-width: 620px; margin: 0 0 28px; }
+  .lede em { color: var(--ink); }
+
+  .cards { display: flex; gap: var(--gap); }
+  .card { flex: 1; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; }
+  .card h2 { font-size: 17px; margin: 12px 0 4px; }
+  .card p { margin: 0; color: var(--muted); }
+  .dot { width: 36px; height: 36px; border-radius: 50%; background: var(--brand); }
+  .card:nth-child(2) .dot { background: hsl(160, 60%, 40%); }
+  .card:nth-child(3) .dot { background: hsl(28, 90%, 55%); }
+  .card:last-child { border-color: var(--brand); border-width: 2px; }
+
+  .split { display: flex; gap: var(--gap); margin-top: var(--gap); align-items: flex-start; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; }
+  .panel.wide { flex: 2; }
+  .panel.narrow { flex: 1; }
+  .panel h3 { margin: 0 0 8px; font-size: 15px; }
+  .rows div { display: flex; justify-content: space-between; padding: 8px 10px; border-radius: 6px; }
+  .rows div:nth-child(odd) { background: hsl(220, 20%, 96%); }
+  .rows span:last-child { color: var(--muted); }
+  .tag { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; background: hsl(160, 55%, 90%); color: hsl(160, 70%, 24%); }
+  .tag[data-state="off"] { background: hsl(0, 0%, 90%); color: hsl(0, 0%, 40%); opacity: 0.8; }
+  ul.checks { margin: 0; padding-left: 20px; }
+  ul.checks li + li { margin-top: 4px; }
+  footer { margin-top: 28px; display: flex; justify-content: center; gap: 8px; color: var(--muted); font-size: 13px; }
+
+  @media (max-width: 700px) {
+    .cards, .split { flex-direction: column; }
+    header.bar { padding: 14px 16px; }
+    main { padding: 24px 16px; }
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <span class="logo">wavelength</span>
+  <nav><a href="#">Overview</a><a href="#">Engine</a><a href="#">Roadmap</a></nav>
+  <a class="cta" href="#">Get started</a>
+</header>
+<main>
+  <div class="eyebrow">Style engine</div>
+  <h1>Pages that look designed</h1>
+  <p class="lede">Custom properties, flexbox, media queries and rounded corners, all resolved by an engine written <em>from scratch</em>.</p>
+
+  <section class="cards">
+    <article class="card"><div class="dot"></div><h2>Selectors</h2><p>Child and sibling combinators, attributes and structural pseudo-classes.</p></article>
+    <article class="card"><div class="dot"></div><h2>Cascade</h2><p>Variables, calc(), viewport units and inheritance keywords.</p></article>
+    <article class="card"><div class="dot"></div><h2>Layout</h2><p>Flex rows and columns with gaps, growth and alignment.</p></article>
+  </section>
+
+  <section class="split">
+    <div class="panel wide">
+      <h3>Feature status</h3>
+      <div class="rows">
+        <div><span>Flexbox</span><span class="tag">ready</span></div>
+        <div><span>Media queries</span><span class="tag">ready</span></div>
+        <div><span>Grid</span><span class="tag" data-state="off">planned</span></div>
+        <div><span>Positioning</span><span class="tag" data-state="off">planned</span></div>
+      </div>
+    </div>
+    <div class="panel narrow">
+      <h3>Also new</h3>
+      <ul class="checks">
+        <li>List markers</li>
+        <li><i>Italic</i> and <b>bold</b> faces</li>
+        <li>Opacity and hsl() colours</li>
+      </ul>
+    </div>
+  </section>
+  <footer><span>Rendered by wavelength</span><span>·</span><a href="https://example.com">example.com</a></footer>
+</main>
+</body>
+</html>

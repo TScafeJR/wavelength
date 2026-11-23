@@ -2,7 +2,7 @@
 
 Everything here is not implemented yet. The milestones are roughly in the order they will be built, and the parity milestones each have a bar that can be checked on a machine with no internet access. The end goal is that a saved news page rendered by this engine and overlaid on Chrome's screenshot barely differs by a pixel.
 
-What already works is described in the README: a simplified HTML parser, basic selectors and cascade, block and inline layout with text, simple tables and form controls, loading over HTTP and HTTPS, a browser window on macOS with tabs and session history, and the parity report. Each of those is a first version, and the sections below say what each still lacks.
+What already works is described in the README: a simplified HTML parser, a style engine with media queries and custom properties, block, inline and flex layout with text, simple tables and form controls, loading over HTTP and HTTPS, a browser window on macOS with tabs and session history, and the parity report. Each of those is a first version, and the sections below say what each still lacks.
 
 ## 1. An HTML parser that passes html5lib
 
@@ -20,51 +20,56 @@ Done when the html5lib tokenizer and tree-construction test suites pass, with a 
 
 Text is drawn with the engine's own rasteriser, but its pixels do not match Chrome's, and one sans-serif family stands in for every font.
 
-- `font-family` matching and fallback, italic faces, and web fonts through `@font-face`
+- `font-family` matching and fallback, including serif and monospace families, and web fonts through `@font-face`
 - OpenType fonts with CFF outlines, and TrueType hinting where Chrome applies it
 - Shaping: kerning and ligatures for Latin text, then complex scripts and bidirectional text
 - Antialiasing, gamma and sub-pixel glyph positioning that match Chrome's on the same fonts
-- `font-style`, `letter-spacing`, `word-spacing`, `text-transform`, `text-indent`, `text-shadow`
+- `letter-spacing`, `word-spacing`, `text-indent`, `text-shadow`
 - Preserved whitespace and newlines for `pre`, breaking inside long words, hyphenation, `text-overflow`
-- List markers for `ul` and `ol`
+- List marker styles beyond bullets and numbers, and markers positioned inside the box
 
 Done when a set of text-only fixtures using bundled, openly licensed fonts stays within an agreed pixel tolerance of Chrome.
 
 ## 3. The full cascade
 
-- Remaining selectors: child, sibling and attribute selectors, pseudo-classes and pseudo-elements
-- `inherit`, `initial`, `unset`, and inheritance for every inherited property
-- Custom properties and `var()`, `calc()`, viewport units (`vw`, `vh`), and percentages for margins and padding
-- At-rules: `@media`, `@import`, `@supports`, `@font-face`
-- Colour functions such as `hsl()` and `light-dark()`, `currentcolor`, and the full set of named colours
+The style engine handles combinators, attribute selectors, structural pseudo-classes, media queries, custom properties, `calc()` and the inheritance keywords. What it still lacks:
+
+- Pseudo-elements with generated content (`::before`, `::after`, `::marker`), and `:has()`
+- Interaction states: `:hover`, `:focus`, `:active` and `:visited`, which parse today but never match
+- At-rules: `@import`, `@supports`, `@font-face`, `@container`, and real ordering for `@layer`
+- CSS nesting, `revert`, and `attr()`
+- Percentages for margins and padding, and `calc()` that mixes percentages inside `min()` and `max()`
+- Colour functions beyond `rgb()` and `hsl()`, such as `oklch()`, `color-mix()` and `light-dark()`, plus a dark colour scheme
 - A user-agent stylesheet that covers every HTML element exactly as Chrome's does
-- A real CSS tokenizer in place of the current string splitting, with correct error recovery
+- A real CSS tokenizer in place of the current bracket-aware splitting, with the specified error recovery
+- Rule lookup by id, class and tag, so each element is not tested against every rule
 
 ## 4. Block, inline and float layout
 
 - Margin collapsing between parents and children and through empty boxes
-- `box-sizing`, `min-width`, `min-height`, `max-height`, percentage heights
+- Percentage heights, `aspect-ratio`, and `min-content` and `max-content` as sizes
 - Inline boxes with their own backgrounds, borders, padding and margins, and `vertical-align` within a line
 - Floats and `clear`
-- Positioning (`relative`, `absolute`, `fixed`, `sticky`) and `z-index` stacking contexts
+- Positioning: absolutely positioned boxes are left out of the page today, and fixed and sticky ones are laid out in the normal flow
 - `overflow` and clipping, including text that overflows form fields
-- `border-radius`, dashed and dotted borders, mitred border corners
-- Replaced elements: JPEG, GIF, WebP and SVG images, `alt` text, `<select>` and `<textarea>` contents, checked states
+- Replaced elements: JPEG, GIF, WebP and SVG images, `alt` text, `object-fit`, `<select>` and `<textarea>` contents, checked states
 - Sub-pixel layout in 1/64 pixel units, the way Chrome does it, so fractional lengths snap to the same device pixels
 
 ## 5. Flexbox, grid and tables
 
-Flex and grid containers are laid out as plain blocks today, and tables use a simplified algorithm.
+Flexbox covers rows and columns with wrapping, gaps, growth, `justify-content`, `align-items` and auto margins. Grid containers are still laid out as plain blocks, and tables use a simplified algorithm.
 
-- Flexbox, including wrapping, alignment and `gap`
+- The rest of flexbox: `flex-shrink` factors and minimum sizes, `flex-basis` lengths, `align-self`, `align-content`, `order`, reversed directions and baseline alignment
 - Grid, including named areas, `fr` units, auto-placement and `minmax()`
 - Table layout as specified: `colspan`, `rowspan`, `cellpadding`, captions, collapsed borders, fixed layout, baseline alignment
 - Caching of intrinsic sizes, since nested shrink-to-fit boxes are measured again at every level
 
 ## 6. Painting
 
+- A separate radius for each corner, elliptical radii, and images clipped to rounded boxes
+- Dashed and dotted borders, mitred corners where border colours differ, `outline`
 - Background images, gradients, `background-position`, `background-size` and `background-repeat`
-- `opacity`, `box-shadow`, `outline`, transforms and filters
+- `box-shadow`, transforms, filters, and `opacity` applied to a box as a group
 - Smooth image scaling in place of nearest-neighbour sampling
 - A device pixel ratio other than 1, so the window is sharp on high-density displays
 

@@ -4,7 +4,10 @@
 //! the rest of the network stack out of this crate. Requests carry a generic
 //! user agent and no cookies, and nothing is stored between them.
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Error, Result};
 use crate::url;
@@ -109,6 +112,31 @@ pub fn fetch(target: &str) -> Result<Response> {
     })
 }
 
+/// How many requests [`fetch_all`] runs at once.
+const PARALLEL_FETCHES: usize = 8;
+
+/// Fetches several URLs at once. Each maps to its bytes, or to `None` if it could not be loaded.
+pub fn fetch_all(targets: &[String]) -> HashMap<String, Option<Vec<u8>>> {
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(HashMap::new());
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL_FETCHES.min(targets.len()) {
+            scope.spawn(|| {
+                // Each worker takes the next URL nobody has started on.
+                while let Some(target) = targets.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let body = fetch(target).ok().map(|response| response.body);
+                    if let Ok(mut results) = results.lock() {
+                        results.insert(target.clone(), body);
+                    }
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +175,15 @@ mod tests {
             fetch("file:///no/such/file"),
             Err(Error::Network(_))
         ));
+
+        let targets = [manifest.to_owned(), "file:///no/such/file".to_owned()];
+        let fetched = fetch_all(&targets);
+        assert!(
+            fetched[manifest]
+                .as_ref()
+                .is_some_and(|body| !body.is_empty())
+        );
+        assert_eq!(fetched["file:///no/such/file"], None);
         Ok(())
     }
 }

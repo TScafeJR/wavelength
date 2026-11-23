@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 use crate::error::{Error, Result};
-use crate::font::Fonts;
+use crate::font::{Face, Fonts};
 use crate::image::Image;
 use crate::page::{Page, Viewport};
 use crate::paint::{self, TextStyle};
@@ -48,25 +48,41 @@ const MUTED_COLOR: Color = Color::rgb(140, 143, 148);
 
 const START_PAGE: &str = "<!doctype html><title>New tab</title>
 <style>
-  body { margin: 60px auto; max-width: 560px; color: #202124; font-size: 15px; line-height: 1.5 }
-  h1 { font-size: 30px; margin: 0 0 6px }
-  p { margin: 10px 0 }
-  .muted { color: #5f6368 }
-  .links a { display: block; padding: 4px 0 }
+  :root { --ink: #1f2330; --muted: #6a7080; --line: #e2e5ec; }
+  body { margin: 0; background: #f3f4f8; color: var(--ink); font: 15px/1.5 sans-serif; }
+  main { max-width: 680px; margin: 0 auto; padding: 64px 20px; }
+  h1 { font-size: 32px; margin: 0 0 4px; }
+  p { margin: 0; }
+  .muted { color: var(--muted); }
+  .links { display: flex; gap: 12px; margin: 26px 0; }
+  .links a { flex: 1; background: #fff; border: 1px solid var(--line); border-radius: 12px;
+             padding: 14px 16px; color: var(--ink); text-decoration: none; font-weight: 700; }
+  .links span { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+  .keys { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 6px 18px;
+          margin-bottom: 22px; }
+  .keys div { display: flex; justify-content: space-between; padding: 8px 0; }
+  .keys div + div { border-top: 1px solid var(--line); }
+  .keys span:last-child { color: var(--muted); }
+  @media (max-width: 620px) { .links { flex-direction: column; } }
 </style>
+<main>
 <h1>Wavelength</h1>
-<p class=muted>A browser engine written from scratch in Rust.</p>
-<p>Type an address in the bar above and press Enter. Pages are drawn by the engine itself,
-so sites that need JavaScript or modern layout will look plain or incomplete.</p>
+<p class=muted>A browser engine written from scratch in Rust. Type an address above and press Enter.</p>
 <div class=links>
-  <a href='https://www.google.com/'>google.com</a>
-  <a href='https://example.com/'>example.com</a>
-  <a href='https://info.cern.ch/hypertext/WWW/TheProject.html'>The first website</a>
-  <a href='wavelength://history'>History</a>
+  <a href='https://www.google.com/'>Google<span>google.com</span></a>
+  <a href='https://news.ycombinator.com/'>Hacker News<span>news.ycombinator.com</span></a>
+  <a href='https://en.wikipedia.org/wiki/Web_browser'>Wikipedia<span>en.wikipedia.org</span></a>
+  <a href='wavelength://history'>History<span>this session</span></a>
 </div>
-<p class=muted>Cmd+T opens a tab and Cmd+W closes it. Cmd+[ and Cmd+] go back and forward,
-Cmd+Y shows history, Cmd+L focuses the address bar and Cmd+R reloads.
-Hold Cmd while clicking a link to open it in a new tab.</p>";
+<div class=keys>
+  <div><span>Open and close tabs</span><span>Cmd+T, Cmd+W</span></div>
+  <div><span>Back and forward</span><span>Cmd+[, Cmd+]</span></div>
+  <div><span>Address bar, reload, history</span><span>Cmd+L, Cmd+R, Cmd+Y</span></div>
+  <div><span>Open a link in a new tab</span><span>Cmd+click</span></div>
+</div>
+<p class=muted>Pages are drawn by the engine itself. It does not run JavaScript, so sites that
+depend on it will look plain or incomplete.</p>
+</main>";
 
 /// Forwards typed characters from the window to the main loop.
 struct Typed(Sender<char>);
@@ -252,34 +268,20 @@ impl Browser {
     /// Fetches and lays out `target`, returning the page and the address to show for it.
     fn load(&mut self, target: &str) -> (Page, String) {
         let viewport = page_viewport(self.size);
-        let cache = &mut self.cache;
-        let mut loader = |resource: &str| {
-            let fetch = || net::fetch(resource).ok().map(|response| response.body);
-            cache
-                .entry(resource.to_owned())
-                .or_insert_with(fetch)
-                .clone()
-        };
-        match target {
-            START_URL => (
-                Page::open(START_PAGE, START_URL, viewport, &mut loader),
-                String::new(),
+        // Work out what to show first: the markup, the address it resolves links against,
+        // and the address to display.
+        let mut visited = false;
+        let (html, base, shown) = match target {
+            START_URL => (START_PAGE.to_owned(), START_URL.to_owned(), String::new()),
+            HISTORY_URL => (
+                session::history_page(&self.visits),
+                HISTORY_URL.to_owned(),
+                HISTORY_URL.to_owned(),
             ),
-            HISTORY_URL => {
-                let html = session::history_page(&self.visits);
-                (
-                    Page::open(&html, HISTORY_URL, viewport, &mut loader),
-                    HISTORY_URL.to_owned(),
-                )
-            }
             _ => match net::fetch(target) {
                 Ok(response) => {
-                    let page = Page::open(&response.text(), &response.url, viewport, &mut loader);
-                    self.visits.push(Visit {
-                        url: response.url.clone(),
-                        title: page.title().unwrap_or_default(),
-                    });
-                    (page, response.url)
+                    visited = true;
+                    (response.text(), response.url.clone(), response.url)
                 }
                 Err(error) => {
                     let html = format!(
@@ -287,13 +289,27 @@ impl Browser {
                          <h1 style='font-size: 24px'>This page could not be loaded</h1><p>{}</p>",
                         session::escape(&error.to_string())
                     );
-                    (
-                        Page::open(&html, target, viewport, &mut loader),
-                        target.to_owned(),
-                    )
+                    (html, target.to_owned(), target.to_owned())
                 }
             },
+        };
+
+        // Fetch whatever the page needs that is not cached yet, several at a time.
+        let missing: Vec<String> = Page::resource_urls(&html, &base)
+            .into_iter()
+            .filter(|resource| !self.cache.contains_key(resource))
+            .collect();
+        self.cache.extend(net::fetch_all(&missing));
+        let cache = &self.cache;
+        let mut loader = |resource: &str| cache.get(resource).cloned().flatten();
+        let page = Page::open(&html, &base, viewport, &mut loader);
+        if visited {
+            self.visits.push(Visit {
+                url: shown.clone(),
+                title: page.title().unwrap_or_default(),
+            });
         }
+        (page, shown)
     }
 
     /// Loads `target` in the current tab. `record` adds it to the tab's back and forward list.
@@ -572,7 +588,7 @@ impl Browser {
         let tab_width = self.tab_width();
         let text = |color| TextStyle {
             size: TAB_TITLE_SIZE,
-            bold: false,
+            face: Face::REGULAR,
             color,
         };
         for (index, tab) in self.tabs.iter().enumerate() {
@@ -620,7 +636,7 @@ impl Browser {
         }
         let plus = TextStyle {
             size: 18.0,
-            bold: false,
+            face: Face::REGULAR,
             color: TEXT_COLOR,
         };
         let plus_x = self.tabs.len() as f32 * tab_width + 12.0;
@@ -636,7 +652,7 @@ impl Browser {
 
         let arrow = |enabled: bool| TextStyle {
             size: 20.0,
-            bold: false,
+            face: Face::REGULAR,
             color: if enabled { TEXT_COLOR } else { MUTED_COLOR },
         };
         paint::draw_text(
@@ -659,7 +675,7 @@ impl Browser {
 
         let label = TextStyle {
             size: 13.0,
-            bold: false,
+            face: Face::REGULAR,
             color: TEXT_COLOR,
         };
         let history_x = width as f32 - HISTORY_BUTTON_WIDTH + 14.0;
@@ -699,7 +715,7 @@ impl Browser {
         }
         let style = TextStyle {
             size: ADDRESS_SIZE,
-            bold: false,
+            face: Face::REGULAR,
             color: if placeholder { MUTED_COLOR } else { TEXT_COLOR },
         };
         paint::draw_text(

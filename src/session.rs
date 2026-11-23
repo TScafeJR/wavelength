@@ -72,12 +72,17 @@ pub fn history_page(visits: &[Visit]) -> String {
     let mut html = String::from(
         "<!doctype html><title>History</title>
 <style>
-  body { margin: 40px auto; max-width: 720px; color: #202124; font-size: 15px; line-height: 1.5 }
-  h1 { font-size: 26px; margin: 0 0 4px }
-  .muted { color: #5f6368 }
-  .visit { padding: 9px 0; border-bottom: 1px solid #e3e3e3 }
-  .address { color: #5f6368; font-size: 12px }
+  :root { --ink: #1f2330; --muted: #6a7080; --line: #e2e5ec; }
+  body { margin: 0; background: #f3f4f8; color: var(--ink); font: 15px/1.5 sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 44px 20px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  p { margin: 0 0 20px; }
+  .muted { color: var(--muted); }
+  .visit { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin-bottom: 8px; }
+  .visit a { color: var(--ink); text-decoration: none; font-weight: 700; }
+  .address { color: var(--muted); font-size: 12px; }
 </style>
+<main>
 <h1>History</h1>
 <p class=muted>Pages opened since this window started, newest first. Nothing is saved when you quit.</p>
 ",
@@ -92,6 +97,7 @@ pub fn history_page(visits: &[Visit]) -> String {
             "<div class=visit><a href=\"{url}\">{label}</a><div class=address>{url}</div></div>\n"
         ));
     }
+    html.push_str("</main>");
     html
 }
 

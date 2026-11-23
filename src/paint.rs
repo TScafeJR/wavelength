@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::dom::{Document, NodeId};
-use crate::font::Fonts;
+use crate::font::{Face, Fonts};
 use crate::image::Image;
 use crate::layout::{Fragment, LayoutBox, Rect};
 use crate::style::Color;
@@ -64,8 +64,8 @@ pub fn paint(scene: Scene<'_>, width: u32, height: u32, scroll_y: f32) -> Image 
 pub struct TextStyle {
     /// The font size in pixels.
     pub size: f32,
-    /// Whether the bold face is used.
-    pub bold: bool,
+    /// The font face used.
+    pub face: Face,
     /// The text colour.
     pub color: Color,
 }
@@ -80,7 +80,7 @@ pub fn draw_text(
     style: TextStyle,
 ) {
     let (color, baseline) = (rgba(style.color), baseline.round() as i64);
-    fonts.glyphs(text, style.size, style.bold, |pen, glyph| {
+    fonts.glyphs(text, style.size, style.face, |pen, glyph| {
         let left = (x + pen).round() as i64 + i64::from(glyph.left);
         let top = baseline + i64::from(glyph.top);
         for (index, &coverage) in glyph.coverage.iter().enumerate() {
@@ -103,35 +103,56 @@ struct Painter<'a> {
 impl Painter<'_> {
     fn paint_box(&mut self, layout_box: &LayoutBox) {
         let (rect, style) = (layout_box.rect, &layout_box.style);
+        let radius = style.used_radius(rect.width, rect.height);
         if self.skip_background != Some(layout_box.node) {
-            self.fill(rect, style.background);
+            self.fill_rounded(rect, radius, 0.0, style.fade(style.background));
         }
 
         let (border, colors) = (style.border(), style.used_border_color());
         let inner_height = rect.height - border.top - border.bottom;
-        let edge = |x, y, width, height| Rect {
-            x,
-            y,
-            width,
-            height,
-        };
-        let right_x = rect.x + rect.width - border.right;
-        let bottom_y = rect.y + rect.height - border.bottom;
-        self.fill(edge(rect.x, rect.y, rect.width, border.top), colors.top);
-        self.fill(
-            edge(rect.x, bottom_y, rect.width, border.bottom),
-            colors.bottom,
-        );
-        self.fill(
-            edge(rect.x, rect.y + border.top, border.left, inner_height),
-            colors.left,
-        );
-        self.fill(
-            edge(right_x, rect.y + border.top, border.right, inner_height),
-            colors.right,
-        );
+        let widths = [border.top, border.right, border.bottom, border.left];
+        let uniform = widths.iter().all(|width| *width == border.top)
+            && [colors.right, colors.bottom, colors.left]
+                .iter()
+                .all(|color| *color == colors.top);
+        if border.top <= 0.0 && uniform {
+            // No border to draw.
+        } else if radius > 0.0 && uniform {
+            // A rounded border is a ring: the rounded box with a smaller rounded box cut out of it.
+            self.fill_rounded(rect, radius, border.top, style.fade(colors.top));
+        } else {
+            let edge = |x, y, width, height| Rect {
+                x,
+                y,
+                width,
+                height,
+            };
+            let right_x = rect.x + rect.width - border.right;
+            let bottom_y = rect.y + rect.height - border.bottom;
+            self.fill(
+                edge(rect.x, rect.y, rect.width, border.top),
+                style.fade(colors.top),
+            );
+            self.fill(
+                edge(rect.x, bottom_y, rect.width, border.bottom),
+                style.fade(colors.bottom),
+            );
+            self.fill(
+                edge(rect.x, rect.y + border.top, border.left, inner_height),
+                style.fade(colors.left),
+            );
+            self.fill(
+                edge(right_x, rect.y + border.top, border.right, inner_height),
+                style.fade(colors.right),
+            );
+        }
 
-        if let Some(picture) = self.scene.images.get(&layout_box.node) {
+        if let Some(picture) = self
+            .scene
+            .images
+            .get(&layout_box.node)
+            .filter(|_| style.visible)
+        {
             let padding = style.padding;
             let content = Rect {
                 x: rect.x + border.left + padding.left,
@@ -150,6 +171,63 @@ impl Painter<'_> {
         }
     }
 
+    /// Fills a box with rounded corners, antialiasing the curves. With a
+    /// `ring` width only that much of the box's edge is filled, which draws a border.
+    fn fill_rounded(&mut self, rect: Rect, radius: f32, ring: f32, color: Color) {
+        if radius <= 0.0 && ring <= 0.0 {
+            return self.fill(rect, color);
+        }
+        if color.is_transparent() {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.pixel_bounds(rect) else {
+            return;
+        };
+        // Coverage is measured against the whole box, which may extend past the canvas.
+        let left = rect.x.round();
+        let top = (rect.y + self.offset_y).round();
+        let right = (rect.x + rect.width).round();
+        let bottom = (rect.y + self.offset_y + rect.height).round();
+        let coverage = |x: f32, y: f32, inset: f32, radius: f32| {
+            let (left, top, right, bottom) =
+                (left + inset, top + inset, right - inset, bottom - inset);
+            if x < left || x > right || y < top || y > bottom {
+                return 0.0;
+            }
+            // Only points in a corner square are affected by the curve.
+            let nearest_x = x.clamp(
+                (left + radius).min(right - radius),
+                (right - radius).max(left + radius),
+            );
+            let nearest_y = y.clamp(
+                (top + radius).min(bottom - radius),
+                (bottom - radius).max(top + radius),
+            );
+            let distance = ((x - nearest_x).powi(2) + (y - nearest_y).powi(2)).sqrt();
+            (radius - distance + 0.5).clamp(0.0, 1.0)
+        };
+        let rgba = rgba(color);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (center_x, center_y) = (x as f32 + 0.5, y as f32 + 0.5);
+                let outer = coverage(center_x, center_y, 0.0, radius);
+                let amount = if ring > 0.0 {
+                    outer * (1.0 - coverage(center_x, center_y, ring, (radius - ring).max(0.0)))
+                } else {
+                    outer
+                };
+                if amount > 0.0 {
+                    self.image.blend(
+                        i64::from(x),
+                        i64::from(y),
+                        rgba,
+                        (amount * 255.0).round() as u8,
+                    );
+                }
+            }
+        }
+    }
+
     fn paint_text(&mut self, fragment: &Fragment) {
         let baseline = fragment.baseline + self.offset_y;
         let visible = -fragment.size * 2.0..self.image.height() as f32 + fragment.size * 2.0;
@@ -158,7 +236,7 @@ impl Painter<'_> {
         }
         let style = TextStyle {
             size: fragment.size,
-            bold: fragment.bold,
+            face: fragment.face,
             color: fragment.color,
         };
         draw_text(
@@ -319,6 +397,29 @@ mod tests {
     fn translucent_colors_blend_with_what_is_underneath() {
         let image = render("<div style='height: 10px; background: rgba(255, 0, 0, 0.5)'></div>");
         assert_eq!(image.pixel(10, 10), Some([255, 127, 127, 255]));
+    }
+
+    #[test]
+    fn rounded_corners_cut_the_background_and_border() {
+        let image = render(
+            "<div style='width: 40px; height: 40px; background: red; border: 4px solid blue; border-radius: 50%'></div>",
+        );
+        // The box spans 8..56 in both directions: its corners are empty and its centre is filled.
+        assert_eq!(image.pixel(9, 9), Some(WHITE));
+        assert_eq!(image.pixel(54, 54), Some(WHITE));
+        assert_eq!(image.pixel(32, 32), Some(RED));
+        assert_eq!(image.pixel(32, 9), Some(BLUE));
+        assert_eq!(image.pixel(9, 32), Some(BLUE));
+        assert_eq!(image.pixel(32, 14), Some(RED));
+    }
+
+    #[test]
+    fn opacity_and_visibility_fade_a_box_and_its_text() {
+        let faded = render("<div style='height: 10px; background: red; opacity: 0.5'></div>");
+        assert_eq!(faded.pixel(10, 10), Some([255, 127, 127, 255]));
+        let hidden =
+            render("<div style='height: 10px; background: red; visibility: hidden'></div>");
+        assert_eq!(hidden.pixel(10, 10), Some(WHITE));
     }
 
     #[test]

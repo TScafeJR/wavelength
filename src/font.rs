@@ -31,6 +31,28 @@ const BOLD_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
 ];
 
+/// Set this environment variable to a `.ttf` file to use it for italic text.
+pub const ITALIC_FONT_ENV: &str = "WAVELENGTH_FONT_ITALIC";
+/// Set this environment variable to a `.ttf` file to use it for bold italic text.
+pub const BOLD_ITALIC_FONT_ENV: &str = "WAVELENGTH_FONT_BOLD_ITALIC";
+
+const ITALIC_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+    "/Library/Fonts/Arial Italic.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+    "/usr/share/fonts/liberation-sans/LiberationSans-Italic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Oblique.ttf",
+];
+const BOLD_ITALIC_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+    "/Library/Fonts/Arial Bold Italic.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+    "/usr/share/fonts/liberation-sans/LiberationSans-BoldItalic.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-BoldOblique.ttf",
+];
+
 /// Nested composite glyphs deeper than this are treated as empty.
 const MAX_COMPOSITE_DEPTH: u32 = 8;
 
@@ -593,12 +615,41 @@ impl Rasterizer {
     }
 }
 
-/// The regular and bold faces used for all text, with a cache of rasterised glyphs.
+/// Which variant of the font family a run of text uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Face {
+    /// The bold weight.
+    pub bold: bool,
+    /// The italic style.
+    pub italic: bool,
+}
+
+impl Face {
+    /// The upright, regular-weight face.
+    pub const REGULAR: Self = Self {
+        bold: false,
+        italic: false,
+    };
+}
+
+impl From<bool> for Face {
+    /// An upright face that is bold or not.
+    fn from(bold: bool) -> Self {
+        Self {
+            bold,
+            italic: false,
+        }
+    }
+}
+
+/// The four faces of the family used for all text, with a cache of rasterised glyphs.
 #[derive(Debug, Default)]
 pub struct Fonts {
     regular: Option<Font>,
     bold: Option<Font>,
-    cache: Mutex<HashMap<(bool, u32, u32), Arc<Glyph>>>,
+    italic: Option<Font>,
+    bold_italic: Option<Font>,
+    cache: Mutex<HashMap<(Face, u32, u32), Arc<Glyph>>>,
 }
 
 impl Fonts {
@@ -617,6 +668,8 @@ impl Fonts {
             Fonts {
                 regular: load(FONT_ENV, REGULAR_CANDIDATES),
                 bold: load(BOLD_FONT_ENV, BOLD_CANDIDATES),
+                italic: load(ITALIC_FONT_ENV, ITALIC_CANDIDATES),
+                bold_italic: load(BOLD_ITALIC_FONT_ENV, BOLD_ITALIC_CANDIDATES),
                 cache: Mutex::default(),
             }
         })
@@ -627,17 +680,20 @@ impl Fonts {
         self.regular.is_some()
     }
 
-    fn face(&self, bold: bool) -> Option<&Font> {
-        if bold {
-            self.bold.as_ref().or(self.regular.as_ref())
-        } else {
-            self.regular.as_ref()
-        }
+    /// The font for a face, falling back to the nearest one that was found.
+    fn font(&self, face: Face) -> Option<&Font> {
+        let exact = match (face.bold, face.italic) {
+            (true, true) => self.bold_italic.as_ref().or(self.bold.as_ref()),
+            (true, false) => self.bold.as_ref(),
+            (false, true) => self.italic.as_ref(),
+            (false, false) => None,
+        };
+        exact.or(self.regular.as_ref())
     }
 
     /// The vertical metrics of the chosen face at `size` pixels.
-    pub fn metrics(&self, size: f32, bold: bool) -> Metrics {
-        self.face(bold).map_or(
+    pub fn metrics(&self, size: f32, face: impl Into<Face>) -> Metrics {
+        self.font(face.into()).map_or(
             Metrics {
                 ascent: 0.0,
                 descent: 0.0,
@@ -648,13 +704,21 @@ impl Fonts {
     }
 
     /// The width of `text` in pixels.
-    pub fn measure(&self, text: &str, size: f32, bold: bool) -> f32 {
-        self.face(bold).map_or(0.0, |font| font.measure(text, size))
+    pub fn measure(&self, text: &str, size: f32, face: impl Into<Face>) -> f32 {
+        self.font(face.into())
+            .map_or(0.0, |font| font.measure(text, size))
     }
 
     /// Calls `draw` with each glyph of `text` and the pen position it belongs at.
-    pub fn glyphs(&self, text: &str, size: f32, bold: bool, mut draw: impl FnMut(f32, &Glyph)) {
-        let Some(font) = self.face(bold) else {
+    pub fn glyphs(
+        &self,
+        text: &str,
+        size: f32,
+        face: impl Into<Face>,
+        mut draw: impl FnMut(f32, &Glyph),
+    ) {
+        let face = face.into();
+        let Some(font) = self.font(face) else {
             return;
         };
         // Sizes are cached in quarter pixels, which is finer than the eye can tell apart.
@@ -666,11 +730,11 @@ impl Fonts {
                 .cache
                 .lock()
                 .ok()
-                .and_then(|cache| cache.get(&(bold, id, size_key)).cloned());
+                .and_then(|cache| cache.get(&(face, id, size_key)).cloned());
             let glyph = cached.unwrap_or_else(|| {
                 let glyph = Arc::new(font.rasterize(id, size));
                 if let Ok(mut cache) = self.cache.lock() {
-                    cache.insert((bold, id, size_key), Arc::clone(&glyph));
+                    cache.insert((face, id, size_key), Arc::clone(&glyph));
                 }
                 glyph
             });
